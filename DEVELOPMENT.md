@@ -25,9 +25,10 @@ export OMP_LAUNCHPAD_ANONYMOUS=1
 
 ## Native release artifacts
 
-Pushing a tag matching the package version, such as `v0.1.0`, runs
-`.github/workflows/release.yml`. The workflow verifies the source, builds with
-`Cargo.lock`, and produces native packages for:
+Changing `package.json`'s version and pushing that commit to `main` runs
+`.github/workflows/release.yml`. The workflow compares the version with the
+pre-push revision, then verifies the source, builds with `Cargo.lock`, and
+produces native packages for:
 
 - Linux x64 and arm64
 - macOS x64 and arm64
@@ -35,11 +36,12 @@ Pushing a tag matching the package version, such as `v0.1.0`, runs
 
 Each matrix job emits a standalone binary and a platform-specific npm tarball
 named `omp-launchpad-<version>-<platform>-<architecture>`. The release job also
-assembles `omp-launchpad-<version>.tgz`, which contains all six binaries. Tagged
-runs create the GitHub release once, attach every package plus `SHA256SUMS`, and
-publish the universal package to npm through OpenID Connect trusted publishing.
-Rerunning the same tag cannot replace published release assets. Manual workflow
-runs only build downloadable Actions artifacts.
+assembles `omp-launchpad-<version>.tgz`, which contains all six binaries. It
+creates the matching `v<version>` tag and GitHub release, attaches every package
+plus `SHA256SUMS`, and publishes the universal package to npm through OpenID
+Connect trusted publishing. Changes to other `package.json` fields do not
+release a new version. Existing tags, releases, and npm versions remain
+immutable, so reusing a version fails instead of replacing published artifacts.
 
 The universal npm tarball stores the executables at
 `bin/omp-launchpad-<platform>-<architecture>[.exe]`. The TypeScript extension
@@ -49,19 +51,10 @@ selects the command in this order:
 2. The packaged binary matching `process.platform` and `process.arch`
 3. `cargo run --release` from a source checkout
 
-npm requires a package to exist before its trusted publisher can be configured.
-For the initial release only, download `omp-launchpad-<version>.tgz` from that
-GitHub release and publish it while authenticated with npm:
-
-```sh
-npm publish ./omp-launchpad-0.1.0.tgz --access public
-```
-
-Then configure `goulinkh/omp-launchpad` and workflow `release.yml` as the
-package's trusted publisher. Under **Allowed actions**, explicitly enable direct
+npm trusted publishing must authorize `goulinkh/omp-launchpad` and workflow
+`release.yml`. Under **Allowed actions**, explicitly enable direct
 `npm publish`; the default staged-publish grant does not authorize this
-workflow. Later tagged releases publish to npm without a long-lived registry
-token.
+workflow.
 
 Create one platform package locally after building its explicit Rust target:
 
