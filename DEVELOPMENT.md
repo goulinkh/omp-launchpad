@@ -5,16 +5,17 @@
 - Bun
 - Rust 1.88 or newer
 - OMP 18.1.19 or newer
-- An `lpcli` login for authenticated and private-resource operations
+- Launchpad credentials for authenticated and private-resource operations
 
 The pinned toolchain in `rust-toolchain.toml` installs automatically through
-`rustup`. Install and authenticate `lpcli` when write access is required:
+`rustup`. Authenticate from an OMP session when write access is required:
 
-```sh
-cargo install --git https://github.com/canonical/lpcli --locked lpcli
-lpcli login
-lpcli status
+```text
+/launchpad login
+/launchpad status
 ```
+
+The extension uses the bundled `lpcli` library. A separately installed `lpcli` command can also manage the same credentials.
 
 Public resources can be tested without credentials by setting:
 

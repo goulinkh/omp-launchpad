@@ -28,16 +28,6 @@ Search project bugs and repository merge proposals. Authenticated operations can
 - Provides native release binaries for Linux, macOS, and Windows on x64 and arm64.
 - Falls back to building with Cargo when no packaged binary is available.
 
-## Requirements
-
-- OMP 18.1.19 or newer
-- Bun
-- Rust 1.88 or newer when running from a source checkout without a packaged native binary
-- Git for merge-proposal checkout and push operations
-- An authenticated `lpcli` session for private resources and Launchpad write operations
-
-Public Launchpad resources can be read without credentials.
-
 ## Install
 
 Install the extension from GitHub:
@@ -48,13 +38,14 @@ omp plugin install github:goulinkh/omp-launchpad
 
 Start a new OMP process after installation so it loads the extension.
 
-For authenticated or write access, install and log in with `lpcli`:
+For authenticated or write access, start OMP and complete the authentication flow:
 
-```sh
-cargo install --git https://github.com/canonical/lpcli --locked lpcli
-lpcli login
-lpcli status
+```text
+/launchpad login
+/launchpad status
 ```
+
+*Note:* The extension calls its bundled `lpcli` library directly, so a separate `lpcli` installation is not required. The standalone `lpcli` command remains available for direct use when installed; its authentication commands share the same stored credentials.
 
 ## Quick start
 
