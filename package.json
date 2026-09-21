@@ -1,0 +1,28 @@
+{
+  "name": "omp-launchpad",
+  "version": "0.1.0",
+  "description": "Launchpad resources and operations for Oh My Pi",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/goulinkh/omp-launchpad.git"
+  },
+  "keywords": [
+    "omp",
+    "oh-my-pi",
+    "launchpad",
+    "launchpadlib"
+  ],
+  "files": [
+    "index.js",
+    "bridge.py"
+  ],
+  "omp": {
+    "extensions": [
+      "./index.js"
+    ]
+  },
+  "scripts": {
+    "check": "bun --check index.js && python3 -c \"compile(open('bridge.py', encoding='utf-8').read(), 'bridge.py', 'exec')\""
+  }
+}
