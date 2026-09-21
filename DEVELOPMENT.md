@@ -34,6 +34,9 @@ produces native packages for:
 - macOS x64 and arm64
 - Windows x64 and arm64
 
+Linux release binaries are statically linked with musl and do not depend on the
+host's glibc version.
+
 Each matrix job emits a standalone binary and a platform-specific npm tarball
 named `omp-launchpad-<version>-<platform>-<architecture>`. The release job also
 assembles `omp-launchpad-<version>.tgz`, which contains all six binaries. It
