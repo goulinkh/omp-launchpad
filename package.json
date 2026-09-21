@@ -11,18 +11,28 @@
     "omp",
     "oh-my-pi",
     "launchpad",
-    "launchpadlib"
+    "lpcli",
+    "rust"
   ],
   "files": [
-    "index.js",
-    "bridge.py"
+    "index.ts",
+    "bin",
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    "src"
   ],
   "omp": {
     "extensions": [
-      "./index.js"
+      "./index.ts"
     ]
   },
   "scripts": {
-    "check": "bun --check index.js && python3 -c \"compile(open('bridge.py', encoding='utf-8').read(), 'bridge.py', 'exec')\""
+    "check": "tsc --noEmit && node --check scripts/package-release.mjs && cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.1.19",
+    "@types/bun": "^1.3.14",
+    "typescript": "^5.9.3"
   }
 }
