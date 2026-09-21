@@ -65,7 +65,10 @@ const npm = process.platform === "win32" ? "npm.cmd" : "npm"
 const packOutput = execFileSync(
   npm,
   ["pack", "--ignore-scripts", "--pack-destination", distributionDirectory, "--json"],
-  { encoding: "utf8" }
+  {
+    encoding: "utf8",
+    shell: process.platform === "win32",
+  }
 )
 const packs = JSON.parse(packOutput)
 if (!Array.isArray(packs) || packs.length !== 1 || typeof packs[0].filename !== "string") {
