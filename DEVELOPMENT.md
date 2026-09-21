@@ -33,18 +33,33 @@ Pushing a tag matching the package version, such as `v0.1.0`, runs
 - macOS x64 and arm64
 - Windows x64 and arm64
 
-Each matrix job emits a standalone binary and an installable npm tarball named
-`omp-launchpad-<version>-<platform>-<architecture>`. Tagged runs attach every
-asset plus `SHA256SUMS` to the corresponding GitHub release. Manual workflow
-runs build downloadable Actions artifacts without creating a release.
+Each matrix job emits a standalone binary and a platform-specific npm tarball
+named `omp-launchpad-<version>-<platform>-<architecture>`. The release job also
+assembles `omp-launchpad-<version>.tgz`, which contains all six binaries. Tagged
+runs create the GitHub release once, attach every package plus `SHA256SUMS`, and
+publish the universal package to npm through OpenID Connect trusted publishing.
+Rerunning the same tag cannot replace published release assets. Manual workflow
+runs only build downloadable Actions artifacts.
 
-The tarball stores its executable at
+The universal npm tarball stores the executables at
 `bin/omp-launchpad-<platform>-<architecture>[.exe]`. The TypeScript extension
 selects the command in this order:
 
 1. `OMP_LAUNCHPAD_BINARY`
 2. The packaged binary matching `process.platform` and `process.arch`
 3. `cargo run --release` from a source checkout
+
+npm requires a package to exist before its trusted publisher can be configured.
+For the initial release only, download `omp-launchpad-<version>.tgz` from that
+GitHub release, publish it while authenticated with npm, then configure
+`goulinkh/omp-launchpad` and workflow `release.yml` as the package's trusted
+publisher:
+
+```sh
+npm publish ./omp-launchpad-0.1.0.tgz --access public
+```
+
+Later tagged releases publish to npm without a long-lived registry token.
 
 Create one platform package locally after building its explicit Rust target:
 
@@ -216,11 +231,11 @@ launchpad=read,launchpad_write=execute
 
 The `read` wrapper itself retains OMP's native `read` classification.
 
-To return to the published plugin after local testing, rerun the dotfiles
-plugin installer or install the GitHub source directly:
+To return to the published plugin after local testing, install the pinned npm
+package:
 
 ```sh
-omp plugin install github:goulinkh/omp-launchpad
+omp plugin install omp-launchpad@0.1.0
 ```
 
 ## Bridge-only diagnosis

@@ -30,10 +30,11 @@ Search project bugs and repository merge proposals. Authenticated operations can
 
 ## Install
 
-Install the extension from GitHub:
+Install the versioned npm package. It contains the published Rust binaries for
+every supported platform, so installation does not build repository source:
 
 ```sh
-omp plugin install github:goulinkh/omp-launchpad
+omp plugin install omp-launchpad@0.1.0
 ```
 
 Start a new OMP process after installation so it loads the extension.
@@ -67,34 +68,41 @@ lp://<project>
 lp://~owner/project/+git/repository
 lp://~owner/project/+git/repository/+merge/<id>
 lp://~owner/project/+git/repository/+merge/<id>/diff
+lp://~owner/project/+git/repository/+merge/<id>/diff/<preview-diff-id>
 ```
 
-Bug and merge-proposal views include comments by default. Add `?comments=0` to omit them or `?limit=<n>` to limit them to at most 20. Non-Launchpad paths continue to use OMP's native `read` implementation.
+Bug and merge-proposal views include comments by default. Add `?comments=0` to omit them or `?limit=<n>` to limit them to at most 20. A merge-proposal diff defaults to the current preview diff; select a historical snapshot with the final path segment or `?preview_diff=<id>`. Non-Launchpad paths continue to use OMP's native `read` implementation.
 
 ## Tools
 
-| Tool              | Purpose                                                                                                             |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `read`            | Read individual Launchpad resources and merge-proposal diffs through `lp://` URLs.                                  |
-| `launchpad`       | View repositories, read repository files, and search bugs or merge proposals.                                       |
-| `launchpad_write` | Create bugs or merge proposals, comment or review, change proposal status, and check out or push proposal branches. |
+| Tool              | Purpose                                                                                                                   |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `read`            | Read individual Launchpad resources and current or historical merge-proposal diffs through `lp://` URLs.                 |
+| `launchpad`       | View resources, search, inspect preview history and inline comments, retrieve drafts, and map file lines to diff lines.   |
+| `launchpad_write` | Create or update resources, update inline drafts, submit reviews, and check out or push merge-proposal branches.          |
 
 The dedicated tools expose these operations:
 
-- `launchpad`: `resource_view`, `repo_view`, `file_read`, `search_bugs`, `search_merge_proposals`
-- `launchpad_write`: `bug_create`, `merge_proposal_create`, `comment`, `set_merge_proposal_status`, `merge_proposal_checkout`, `merge_proposal_push`
+- `launchpad`: `resource_view`, `repo_view`, `file_read`, `search_bugs`, `search_merge_proposals`, `preview_diffs`, `inline_comments`, `review_drafts`, `diff_line_map`
+- `launchpad_write`: `bug_create`, `merge_proposal_create`, `comment`, `review_draft_update`, `review_submit`, `set_merge_proposal_status`, `merge_proposal_checkout`, `merge_proposal_push`
 
 Example prompts:
 
 ```text
 Use launchpad to search bugs for target ubuntu with query installer and limit 5.
 
-Use launchpad to search merge proposals in repository launchpad with status "Needs review" and limit 5.
+Use launchpad with op preview_diffs for lp://~owner/project/+git/repository/+merge/123.
+
+Map modified file line 42 in src/main.rs to a global diff line for preview diff 456, then save an inline draft there.
+
+Submit a review for preview diff 456 with vote Approve; include the saved inline drafts.
 
 Check out lp://~owner/project/+git/repository/+merge/123 into /tmp/proposal-123.
 ```
 
 A merge-proposal checkout clones the source branch and adds the target repository as an `upstream` remote when it differs from the source. A push sends the current branch to `origin`; `force_with_lease` is available when explicitly requested.
+
+Inline draft updates and review submissions require an explicit `preview_diff_id`. The bridge re-fetches the merge proposal immediately before each write and rejects a snapshot that is no longer current or is marked stale.
 
 ## Configuration
 

@@ -7,6 +7,10 @@
     "type": "git",
     "url": "git+https://github.com/goulinkh/omp-launchpad.git"
   },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "keywords": [
     "omp",
     "oh-my-pi",
@@ -28,7 +32,7 @@
     ]
   },
   "scripts": {
-    "check": "tsc --noEmit && node --check scripts/package-release.mjs && cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings"
+    "check": "tsc --noEmit && node --check scripts/package-release.mjs && node --check scripts/assemble-npm-package.mjs && cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings"
   },
   "devDependencies": {
     "@oh-my-pi/pi-coding-agent": "18.1.19",
