@@ -51,15 +51,17 @@ selects the command in this order:
 
 npm requires a package to exist before its trusted publisher can be configured.
 For the initial release only, download `omp-launchpad-<version>.tgz` from that
-GitHub release, publish it while authenticated with npm, then configure
-`goulinkh/omp-launchpad` and workflow `release.yml` as the package's trusted
-publisher:
+GitHub release and publish it while authenticated with npm:
 
 ```sh
 npm publish ./omp-launchpad-0.1.0.tgz --access public
 ```
 
-Later tagged releases publish to npm without a long-lived registry token.
+Then configure `goulinkh/omp-launchpad` and workflow `release.yml` as the
+package's trusted publisher. Under **Allowed actions**, explicitly enable direct
+`npm publish`; the default staged-publish grant does not authorize this
+workflow. Later tagged releases publish to npm without a long-lived registry
+token.
 
 Create one platform package locally after building its explicit Rust target:
 

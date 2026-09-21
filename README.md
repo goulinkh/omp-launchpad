@@ -1,4 +1,7 @@
-# omp-launchpad
+<h1>
+  <img src="assets/launchpad.svg" alt="Launchpad logo" title="Launchpad" width="20">
+  omp-launchpad
+</h1>
 
 `omp-launchpad` is a [Launchpad](https://launchpad.net/) integration for Oh My Pi (OMP). It lets agents read Launchpad URLs through OMP's standard `read` tool and adds dedicated tools for searching, editing, and working with Launchpad bugs, Git repositories, and merge proposals.
 
@@ -30,11 +33,11 @@ Search project bugs and repository merge proposals. Authenticated operations can
 
 ## Install
 
-Install the versioned npm package. It contains the published Rust binaries for
-every supported platform, so installation does not build repository source:
+Install the npm package. It contains the published Rust binaries for every
+supported platform, so installation does not build repository source:
 
 ```sh
-omp plugin install omp-launchpad@0.1.0
+omp plugin install omp-launchpad
 ```
 
 Start a new OMP process after installation so it loads the extension.

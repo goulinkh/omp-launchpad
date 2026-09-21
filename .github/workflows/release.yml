@@ -151,7 +151,6 @@ jobs:
     needs: release
     runs-on: ubuntu-24.04
     permissions:
-      contents: read
       id-token: write
     steps:
       - name: Set up Node.js

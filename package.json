@@ -1,6 +1,6 @@
 {
   "name": "omp-launchpad",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Launchpad resources and operations for Oh My Pi",
   "type": "module",
   "repository": {
@@ -24,7 +24,8 @@
     "Cargo.toml",
     "Cargo.lock",
     "rust-toolchain.toml",
-    "src"
+    "src",
+    "assets"
   ],
   "omp": {
     "extensions": [

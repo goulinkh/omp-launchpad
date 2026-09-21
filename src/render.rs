@@ -1,5 +1,7 @@
 use serde_json::Value;
 
+use crate::diff::{DiffLineKind, DiffLocation, DiffSide};
+
 pub fn render_bug(
     bug: &Value,
     tasks: &[Value],
@@ -174,6 +176,97 @@ pub fn render_repository(repository: &Value) -> String {
         text_field(repository, "description").unwrap_or_default(),
     );
     lines.join("\n\n")
+}
+
+pub fn render_preview_diffs(preview_diffs: &[Value], current_id: u64) -> String {
+    let mut preview_diffs: Vec<_> = preview_diffs.iter().collect();
+    preview_diffs.sort_by_key(|preview_diff| {
+        preview_diff
+            .get("id")
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+    });
+    let is_empty = preview_diffs.is_empty();
+    let mut lines = vec!["# Preview diff history".to_owned()];
+    for preview_diff in preview_diffs {
+        let raw_id = preview_diff.get("id").and_then(Value::as_u64);
+        let id = raw_id.map_or_else(|| "?".to_owned(), |id| id.to_string());
+        let current = (raw_id == Some(current_id)).then_some(" · current");
+        let stale = preview_diff
+            .get("stale")
+            .and_then(Value::as_bool)
+            .is_some_and(|stale| stale)
+            .then_some(" · stale");
+        let created = text_field(preview_diff, "date_created")
+            .map(|created| format!(" · {created}"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "- **{id}**{created}{}{}",
+            current.unwrap_or_default(),
+            stale.unwrap_or_default()
+        ));
+    }
+    if is_empty {
+        lines.push("No preview diffs.".to_owned());
+    }
+    lines.join("\n")
+}
+
+pub fn render_inline_comments(comments: &[Value], preview_diff_id: u64) -> String {
+    let mut lines = vec![format!(
+        "# Published inline comments for preview diff {preview_diff_id}"
+    )];
+    for comment in comments {
+        let line = scalar_field(comment, "line_number").unwrap_or_else(|| "?".to_owned());
+        let author = person_field(comment, "person").unwrap_or_else(|| "unknown".to_owned());
+        let date = text_field(comment, "date")
+            .map(|date| format!(" · {date}"))
+            .unwrap_or_default();
+        let text = text_field(comment, "text").unwrap_or_default();
+        lines.push(format!("## Diff line {line} · {author}{date}\n\n{text}"));
+    }
+    if comments.is_empty() {
+        lines.push("No published inline comments.".to_owned());
+    }
+    lines.join("\n\n")
+}
+
+pub fn render_review_drafts(drafts: &Value, preview_diff_id: u64) -> String {
+    let mut lines = vec![format!(
+        "# Review drafts for preview diff {preview_diff_id}"
+    )];
+    let mut drafts: Vec<_> = drafts
+        .as_object()
+        .into_iter()
+        .flat_map(|drafts| drafts.iter())
+        .collect();
+    drafts.sort_by_key(|(line, _)| line.parse::<usize>().unwrap_or_default());
+    for (line, body) in &drafts {
+        lines.push(format!(
+            "## Diff line {line}\n\n{}",
+            body.as_str().unwrap_or_default()
+        ));
+    }
+    if drafts.is_empty() {
+        lines.push("No review drafts.".to_owned());
+    }
+    lines.join("\n\n")
+}
+
+pub fn render_diff_location(location: &DiffLocation, preview_diff_id: u64) -> String {
+    let side = match location.side {
+        DiffSide::Original => "original",
+        DiffSide::Modified => "modified",
+    };
+    let kind = match location.kind {
+        DiffLineKind::Context => "context",
+        DiffLineKind::Added => "added",
+        DiffLineKind::Removed => "removed",
+    };
+    format!(
+        "# Diff line mapping\n\n- **Preview diff:** {preview_diff_id}\n- **Path:** {}\n- **Side:** {side}\n- **File line:** {}\n- **Global diff line:** {}\n- **Kind:** {kind}",
+        location.path, location.file_line, location.diff_line
+    )
 }
 
 pub fn render_generic(resource: &Value) -> String {

@@ -84,7 +84,7 @@ export default function launchpadExtension(pi: ExtensionAPI) {
     description:
       "Read files, directories, archives, databases, web URLs, OMP internal resources, and Launchpad resources. " +
       "Launchpad forms: lp://bugs/<id>, lp://<project>, lp://~owner/project/+git/repo, and " +
-      "lp://~owner/project/+git/repo/+merge/<id>[/diff]. Add ?comments=0 to omit comments.",
+      "lp://~owner/project/+git/repo/+merge/<id>[/diff[/<preview-diff-id>]]. Add ?comments=0 to omit comments.",
     parameters: z.object({
       path: z.string(),
       i: z.string().optional(),
@@ -108,44 +108,81 @@ export default function launchpadExtension(pi: ExtensionAPI) {
     },
   })
 
-  const sharedParameters = {
-    target: z.string().optional(),
-    repository: z.string().optional(),
-    target_repository: z.string().optional(),
-    path: z.string().optional(),
-    branch: z.string().optional(),
-    query: z.string().optional(),
-    status: z.union([z.string(), z.array(z.string())]).optional(),
-    importance: z.union([z.string(), z.array(z.string())]).optional(),
-    tags: z.array(z.string()).optional(),
-    limit: z.number().optional(),
-    title: z.string().optional(),
-    description: z.string().optional(),
-    information_type: z.string().optional(),
-    source_ref: z.string().optional(),
-    target_ref: z.string().optional(),
-    commit_message: z.string().optional(),
-    needs_review: z.boolean().optional(),
-    body: z.string().optional(),
-    subject: z.string().optional(),
-    vote: z
-      .enum(["Approve", "Needs Fixing", "Needs Information", "Abstain", "Disapprove", "Needs Resubmitting"])
-      .optional(),
-    directory: z.string().optional(),
-    force_with_lease: z.boolean().optional(),
-    i: z.string().optional(),
-  }
+  const withIntent = { i: z.string().optional() }
+  const oneOrManyStrings = z.union([z.string(), z.array(z.string())])
+  const positiveInteger = z.number().int().positive()
+  const diffSide = z.enum(["original", "modified"])
+  const reviewVote = z.enum([
+    "Approve",
+    "Needs Fixing",
+    "Needs Information",
+    "Abstain",
+    "Disapprove",
+    "Needs Resubmitting",
+  ])
 
   pi.registerTool({
     name: "launchpad",
     label: "Launchpad",
     description:
-      "Read Launchpad through lpcli. Supports repository and resource views, repository file reads, and bug or " +
-      "merge-proposal search. Prefer read with lp:// URLs for individual bugs and merge proposals.",
-    parameters: z.object({
-      op: z.enum(["resource_view", "repo_view", "file_read", "search_bugs", "search_merge_proposals"]),
-      ...sharedParameters,
-    }),
+      "Read Launchpad through lpcli. Supports repository and resource views, repository file reads, searches, " +
+      "preview-diff history and selection, published inline comments, review drafts, and file-line mapping. " +
+      "Prefer read with lp:// URLs for individual bugs, merge proposals, and diff text.",
+    parameters: z.union([
+      z.object({
+        op: z.literal("resource_view"),
+        target: z.string(),
+        preview_diff_id: positiveInteger.optional(),
+        ...withIntent,
+      }),
+      z.object({ op: z.literal("repo_view"), repository: z.string(), ...withIntent }),
+      z.object({
+        op: z.literal("file_read"),
+        repository: z.string(),
+        path: z.string(),
+        branch: z.string().optional(),
+        ...withIntent,
+      }),
+      z.object({
+        op: z.literal("search_bugs"),
+        target: z.string(),
+        query: z.string().optional(),
+        status: oneOrManyStrings.optional(),
+        importance: oneOrManyStrings.optional(),
+        tags: z.array(z.string()).optional(),
+        limit: positiveInteger.optional(),
+        ...withIntent,
+      }),
+      z.object({
+        op: z.literal("search_merge_proposals"),
+        repository: z.string(),
+        status: oneOrManyStrings.optional(),
+        limit: positiveInteger.optional(),
+        ...withIntent,
+      }),
+      z.object({ op: z.literal("preview_diffs"), target: z.string(), ...withIntent }),
+      z.object({
+        op: z.literal("inline_comments"),
+        target: z.string(),
+        preview_diff_id: positiveInteger,
+        ...withIntent,
+      }),
+      z.object({
+        op: z.literal("review_drafts"),
+        target: z.string(),
+        preview_diff_id: positiveInteger,
+        ...withIntent,
+      }),
+      z.object({
+        op: z.literal("diff_line_map"),
+        target: z.string(),
+        preview_diff_id: positiveInteger,
+        path: z.string(),
+        file_line: positiveInteger,
+        side: diffSide,
+        ...withIntent,
+      }),
+    ]),
     approval: "read",
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const request = params as BridgeRequest
@@ -157,19 +194,74 @@ export default function launchpadExtension(pi: ExtensionAPI) {
     name: "launchpad_write",
     label: "Launchpad Write",
     description:
-      "Mutate Launchpad or local Git state: create bugs or merge proposals, add bug comments or merge-proposal " +
-      "reviews, change merge-proposal status, check out a proposal, or push its checked-out branch.",
-    parameters: z.object({
-      op: z.enum([
-        "bug_create",
-        "merge_proposal_create",
-        "comment",
-        "set_merge_proposal_status",
-        "merge_proposal_checkout",
-        "merge_proposal_push",
-      ]),
-      ...sharedParameters,
-    }),
+      "Mutate Launchpad or local Git state: create bugs or merge proposals, add comments, update inline review " +
+      "drafts, submit reviews, change proposal status, check out a proposal, or push its checked-out branch.",
+    parameters: z.union([
+      z.object({
+        op: z.literal("bug_create"),
+        target: z.string(),
+        title: z.string(),
+        description: z.string(),
+        information_type: z.string().optional(),
+        tags: z.array(z.string()).optional(),
+        ...withIntent,
+      }),
+      z.object({
+        op: z.literal("merge_proposal_create"),
+        repository: z.string(),
+        target_repository: z.string().optional(),
+        source_ref: z.string(),
+        target_ref: z.string(),
+        description: z.string().optional(),
+        commit_message: z.string().optional(),
+        needs_review: z.boolean().optional(),
+        ...withIntent,
+      }),
+      z.object({
+        op: z.literal("comment"),
+        target: z.string(),
+        body: z.string(),
+        subject: z.string().optional(),
+        vote: reviewVote.optional(),
+        ...withIntent,
+      }),
+      z.object({
+        op: z.literal("review_draft_update"),
+        target: z.string(),
+        preview_diff_id: positiveInteger,
+        path: z.string(),
+        file_line: positiveInteger,
+        side: diffSide,
+        body: z.string().optional(),
+        ...withIntent,
+      }),
+      z.object({
+        op: z.literal("review_submit"),
+        target: z.string(),
+        preview_diff_id: positiveInteger,
+        body: z.string().optional(),
+        vote: reviewVote.optional(),
+        ...withIntent,
+      }),
+      z.object({
+        op: z.literal("set_merge_proposal_status"),
+        target: z.string(),
+        status: z.string(),
+        ...withIntent,
+      }),
+      z.object({
+        op: z.literal("merge_proposal_checkout"),
+        target: z.string(),
+        directory: z.string().optional(),
+        ...withIntent,
+      }),
+      z.object({
+        op: z.literal("merge_proposal_push"),
+        directory: z.string().optional(),
+        force_with_lease: z.boolean().optional(),
+        ...withIntent,
+      }),
+    ]),
     approval: "exec",
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const request = params as BridgeRequest

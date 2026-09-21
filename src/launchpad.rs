@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 
 use lpcli::auth;
@@ -8,6 +9,7 @@ use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Value, json};
 use url::Url;
 
+use crate::diff;
 use crate::error::Error;
 use crate::local_git::{self, CheckoutSpec};
 use crate::render;
@@ -33,9 +35,15 @@ pub async fn execute(request: &Request) -> Result<OperationResult> {
         Operation::RepoView => view_repository(&client, request).await,
         Operation::SearchBugs => search_bugs(&client, request).await,
         Operation::SearchMergeProposals => search_merge_proposals(&client, request).await,
+        Operation::PreviewDiffs => view_preview_diffs(&client, request).await,
+        Operation::InlineComments => view_inline_comments(&client, request).await,
+        Operation::ReviewDrafts => view_review_drafts(&client, request).await,
+        Operation::DiffLineMap => map_diff_line(&client, request).await,
         Operation::BugCreate => create_bug(&client, request).await,
         Operation::MergeProposalCreate => create_merge_proposal(&client, request).await,
         Operation::Comment => add_comment(&client, request).await,
+        Operation::ReviewDraftUpdate => update_review_draft(&client, request).await,
+        Operation::ReviewSubmit => submit_review(&client, request).await,
         Operation::SetMergeProposalStatus => set_merge_proposal_status(&client, request).await,
         Operation::MergeProposalCheckout => checkout_merge_proposal(&client, request).await,
         Operation::FileRead | Operation::MergeProposalPush => {
@@ -44,11 +52,11 @@ pub async fn execute(request: &Request) -> Result<OperationResult> {
     }
 }
 
-fn launchpad_client(write: bool) -> Result<LaunchpadClient> {
+fn launchpad_client(require_authentication: bool) -> Result<LaunchpadClient> {
     let force_anonymous = env::var("OMP_LAUNCHPAD_ANONYMOUS").is_ok_and(|value| value == "1");
-    if write && force_anonymous {
+    if require_authentication && force_anonymous {
         return Err(Error::invalid(
-            "write operations are unavailable in anonymous mode",
+            "authenticated operations are unavailable in anonymous mode",
         ));
     }
     let credentials = if force_anonymous {
@@ -56,7 +64,7 @@ fn launchpad_client(write: bool) -> Result<LaunchpadClient> {
     } else {
         match auth::load_credentials() {
             Ok(credentials) => Some(credentials),
-            Err(LpError::NotAuthenticated) if !write => None,
+            Err(LpError::NotAuthenticated) if !require_authentication => None,
             Err(source) => return Err(Error::Launchpad { source }),
         }
     };
@@ -86,7 +94,26 @@ fn api_base_url() -> Result<String> {
 }
 
 async fn view_resource(client: &LaunchpadClient, request: &Request) -> Result<OperationResult> {
-    let target = ResourceTarget::parse(request.target()?)?;
+    let mut target = ResourceTarget::parse(request.target()?)?;
+    if let Some(preview_diff_id) = request.preview_diff_id {
+        if preview_diff_id == 0 {
+            return Err(Error::invalid("preview_diff_id must be greater than zero"));
+        }
+        if !target.diff {
+            return Err(Error::invalid(
+                "preview_diff_id is only valid for a merge proposal diff",
+            ));
+        }
+        if target
+            .preview_diff_id
+            .is_some_and(|id| id != preview_diff_id)
+        {
+            return Err(Error::invalid(
+                "target and preview_diff_id select different snapshots",
+            ));
+        }
+        target.preview_diff_id = Some(preview_diff_id);
+    }
     match &target.kind {
         ResourceKind::Bug { id } => view_bug(client, &target, *id).await,
         ResourceKind::MergeProposal { repository, id } => {
@@ -165,12 +192,9 @@ async fn view_merge_proposal(
     let proposal = get_merge_proposal(client, repository, id).await?;
     let source_url = render::text_field(&proposal, "web_link").map(str::to_owned);
     if target.diff {
-        let preview_diff_link = render::text_field(&proposal, "preview_diff_link")
-            .ok_or_else(|| Error::invalid("this merge proposal has no preview diff"))?;
-        let preview_diff: Value = client.get_url(preview_diff_link).await?;
-        let diff_text_link = render::text_field(&preview_diff, "diff_text_link")
-            .ok_or_else(|| Error::invalid("this merge proposal has no preview diff text"))?;
-        let mut text = client.get_text_url(diff_text_link).await?;
+        let preview_diff = get_preview_diff(client, &proposal, target.preview_diff_id).await?;
+        let preview_diff_id = preview_diff_id(&preview_diff)?;
+        let mut text = get_diff_text(&preview_diff).await?;
         let truncated = text.len() > MAX_FILE_BYTES;
         if truncated {
             text.truncate(floor_char_boundary(&text, MAX_FILE_BYTES));
@@ -179,13 +203,14 @@ async fn view_merge_proposal(
         let details = json!({
             "kind": "branch_merge_proposal",
             "diff": true,
+            "preview_diff_id": preview_diff_id,
+            "stale": preview_diff.get("stale").and_then(Value::as_bool).unwrap_or(false),
             "truncated": truncated,
         });
         return Ok(OperationResult::new(text)
             .with_source_url(source_url)
             .with_details(details));
     }
-
     let comments = if target.include_comments {
         fetch_entries(
             client,
@@ -210,6 +235,87 @@ async fn view_merge_proposal(
         target.comment_limit,
     );
     let details = proposal_details(client, &proposal).await?;
+    Ok(OperationResult::new(text)
+        .with_source_url(source_url)
+        .with_details(details))
+}
+
+async fn view_preview_diffs(
+    client: &LaunchpadClient,
+    request: &Request,
+) -> Result<OperationResult> {
+    let (_, proposal) = request_merge_proposal(client, request).await?;
+    let preview_diffs = get_preview_diffs(client, &proposal).await?;
+    let current = get_preview_diff(client, &proposal, None).await?;
+    let current_id = preview_diff_id(&current)?;
+    let source_url = render::text_field(&proposal, "web_link").map(str::to_owned);
+    let text = render::render_preview_diffs(&preview_diffs, current_id);
+    let details = json!({
+        "kind": "preview_diff_history",
+        "current_preview_diff_id": current_id,
+        "preview_diffs": preview_diffs,
+    });
+    Ok(OperationResult::new(text)
+        .with_source_url(source_url)
+        .with_details(details))
+}
+
+async fn view_inline_comments(
+    client: &LaunchpadClient,
+    request: &Request,
+) -> Result<OperationResult> {
+    let preview_diff_id = request.preview_diff_id()?;
+    let (_, proposal) = request_merge_proposal(client, request).await?;
+    get_preview_diff(client, &proposal, Some(preview_diff_id)).await?;
+    let comments = inline_comments(client, &proposal, preview_diff_id).await?;
+    let source_url = render::text_field(&proposal, "web_link").map(str::to_owned);
+    let text = render::render_inline_comments(&comments, preview_diff_id);
+    let details = json!({
+        "kind": "inline_comments",
+        "preview_diff_id": preview_diff_id,
+        "comments": comments,
+    });
+    Ok(OperationResult::new(text)
+        .with_source_url(source_url)
+        .with_details(details))
+}
+
+async fn view_review_drafts(
+    client: &LaunchpadClient,
+    request: &Request,
+) -> Result<OperationResult> {
+    let preview_diff_id = request.preview_diff_id()?;
+    let (_, proposal) = request_merge_proposal(client, request).await?;
+    get_preview_diff(client, &proposal, Some(preview_diff_id)).await?;
+    let drafts = review_drafts(client, &proposal, preview_diff_id).await?;
+    let source_url = render::text_field(&proposal, "web_link").map(str::to_owned);
+    let text = render::render_review_drafts(&drafts, preview_diff_id);
+    let details = json!({
+        "kind": "review_drafts",
+        "preview_diff_id": preview_diff_id,
+        "drafts": drafts,
+    });
+    Ok(OperationResult::new(text)
+        .with_source_url(source_url)
+        .with_details(details))
+}
+
+async fn map_diff_line(client: &LaunchpadClient, request: &Request) -> Result<OperationResult> {
+    let preview_diff_id = request.preview_diff_id()?;
+    let file_line = request.file_line()?;
+    let side = request.side()?;
+    let (_, proposal) = request_merge_proposal(client, request).await?;
+    let preview_diff = get_preview_diff(client, &proposal, Some(preview_diff_id)).await?;
+    let diff_text = get_diff_text(&preview_diff).await?;
+    let location = diff::map_file_line(&diff_text, request.path("path")?, side, file_line)
+        .ok_or_else(|| Error::invalid("file line is not present in the selected preview diff"))?;
+    let source_url = render::text_field(&proposal, "web_link").map(str::to_owned);
+    let text = render::render_diff_location(&location, preview_diff_id);
+    let details = json!({
+        "kind": "diff_line_mapping",
+        "preview_diff_id": preview_diff_id,
+        "location": location,
+    });
     Ok(OperationResult::new(text)
         .with_source_url(source_url)
         .with_details(details))
@@ -407,6 +513,105 @@ async fn add_comment(client: &LaunchpadClient, request: &Request) -> Result<Oper
         .with_details(details))
 }
 
+async fn update_review_draft(
+    client: &LaunchpadClient,
+    request: &Request,
+) -> Result<OperationResult> {
+    let preview_diff_id = request.preview_diff_id()?;
+    let file_line = request.file_line()?;
+    let side = request.side()?;
+    let (target, proposal) = request_merge_proposal(client, request).await?;
+    let preview_diff = enforce_current_preview_diff(client, &proposal, preview_diff_id).await?;
+    let diff_text = get_diff_text(&preview_diff).await?;
+    let location = diff::map_file_line(&diff_text, request.path("path")?, side, file_line)
+        .ok_or_else(|| Error::invalid("file line is not present in the selected preview diff"))?;
+    if !location.is_commentable() {
+        return Err(Error::invalid(
+            "original-side comments require a removed line",
+        ));
+    }
+
+    let mut drafts = review_drafts(client, &proposal, preview_diff_id).await?;
+    let draft_map = drafts
+        .as_object_mut()
+        .ok_or_else(|| Error::invalid("Launchpad returned invalid review drafts"))?;
+    let diff_line = location.diff_line.to_string();
+    let action = if let Some(body) = request.body.as_deref() {
+        let body = body.trim();
+        if body.is_empty() {
+            return Err(Error::invalid("draft body cannot be empty"));
+        }
+        draft_map.insert(diff_line, Value::String(body.to_owned()));
+        "saved"
+    } else {
+        draft_map.remove(&diff_line);
+        "deleted"
+    };
+    let (_, current_proposal) = request_merge_proposal(client, request).await?;
+    enforce_current_preview_diff(client, &current_proposal, preview_diff_id).await?;
+    save_review_drafts(client, &current_proposal, preview_diff_id, &drafts).await?;
+
+    let source_url = launchpad_web_url(&target.path, "branch_merge_proposal");
+    let side = match location.side {
+        crate::diff::DiffSide::Original => "original",
+        crate::diff::DiffSide::Modified => "modified",
+    };
+    let text = format!(
+        "Review draft {action} on {}:{} ({side}, global diff line {})",
+        location.path, location.file_line, location.diff_line
+    );
+    let details = json!({
+        "kind": "review_draft_update",
+        "preview_diff_id": preview_diff_id,
+        "action": action,
+        "location": location,
+        "drafts": drafts,
+    });
+    Ok(OperationResult::new(text)
+        .with_source_url(Some(source_url))
+        .with_details(details))
+}
+
+async fn submit_review(client: &LaunchpadClient, request: &Request) -> Result<OperationResult> {
+    let preview_diff_id = request.preview_diff_id()?;
+    let (target, proposal) = request_merge_proposal(client, request).await?;
+    enforce_current_preview_diff(client, &proposal, preview_diff_id).await?;
+    let drafts = review_drafts(client, &proposal, preview_diff_id).await?;
+    let draft_count = drafts.as_object().map_or(0, serde_json::Map::len);
+    let content = request.body.as_deref().unwrap_or_default();
+    if content.trim().is_empty() && request.vote.is_none() && draft_count == 0 {
+        return Err(Error::invalid(
+            "review must include content, a vote, or inline drafts",
+        ));
+    }
+    let (_, current_proposal) = request_merge_proposal(client, request).await?;
+    enforce_current_preview_diff(client, &current_proposal, preview_diff_id).await?;
+    create_inline_review(
+        client,
+        &current_proposal,
+        preview_diff_id,
+        content,
+        &drafts,
+        request.vote.as_deref(),
+    )
+    .await?;
+
+    let source_url = launchpad_web_url(&target.path, "branch_merge_proposal");
+    let text = format!(
+        "Review submitted with {draft_count} inline comment{}: {source_url}",
+        if draft_count == 1 { "" } else { "s" }
+    );
+    let details = json!({
+        "kind": "inline_review",
+        "preview_diff_id": preview_diff_id,
+        "inline_comment_count": draft_count,
+        "vote": request.vote,
+    });
+    Ok(OperationResult::new(text)
+        .with_source_url(Some(source_url))
+        .with_details(details))
+}
+
 async fn set_merge_proposal_status(
     client: &LaunchpadClient,
     request: &Request,
@@ -495,6 +700,273 @@ async fn read_repository_file(request: &Request) -> Result<OperationResult> {
     Ok(OperationResult::new(text)
         .with_source_url(Some(url.to_string()))
         .with_details(details))
+}
+
+async fn request_merge_proposal(
+    client: &LaunchpadClient,
+    request: &Request,
+) -> Result<(ResourceTarget, Value)> {
+    let target = ResourceTarget::parse(request.target()?)?;
+    let (repository, id) = match &target.kind {
+        ResourceKind::MergeProposal { repository, id } => (repository.clone(), *id),
+        ResourceKind::Bug { .. } | ResourceKind::Repository | ResourceKind::Generic => {
+            return Err(Error::invalid("operation requires a merge proposal target"));
+        }
+    };
+    let proposal = get_merge_proposal(client, &repository, id).await?;
+    Ok((target, proposal))
+}
+
+async fn get_preview_diffs(client: &LaunchpadClient, proposal: &Value) -> Result<Vec<Value>> {
+    let collection_link = render::text_field(proposal, "preview_diffs_collection_link")
+        .ok_or_else(|| Error::invalid("merge proposal has no preview diff history"))?;
+    fetch_all_entries(client, collection_link).await
+}
+
+async fn get_preview_diff(
+    client: &LaunchpadClient,
+    proposal: &Value,
+    requested_id: Option<u64>,
+) -> Result<Value> {
+    if let Some(requested_id) = requested_id {
+        return get_preview_diffs(client, proposal)
+            .await?
+            .into_iter()
+            .find(|preview_diff| {
+                preview_diff.get("id").and_then(Value::as_u64) == Some(requested_id)
+            })
+            .ok_or_else(|| {
+                Error::invalid(format!(
+                    "preview diff {requested_id} does not belong to this merge proposal"
+                ))
+            });
+    }
+
+    let preview_diff_link = render::text_field(proposal, "preview_diff_link")
+        .ok_or_else(|| Error::invalid("merge proposal has no current preview diff"))?;
+    client.get_url(preview_diff_link).await.map_err(Into::into)
+}
+
+fn preview_diff_id(preview_diff: &Value) -> Result<u64> {
+    preview_diff
+        .get("id")
+        .and_then(Value::as_u64)
+        .filter(|id| *id > 0)
+        .ok_or_else(|| Error::invalid("Launchpad returned a preview diff without an ID"))
+}
+
+async fn get_diff_text(preview_diff: &Value) -> Result<String> {
+    let diff_text_link = render::text_field(preview_diff, "diff_text_link")
+        .ok_or_else(|| Error::invalid("preview diff has no diff text"))?;
+    let url = diff_download_url(diff_text_link)?;
+    let response = reqwest::get(url.clone())
+        .await
+        .map_err(|source| Error::Web {
+            url: url.to_string(),
+            source,
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(Error::HttpStatus {
+            url: url.to_string(),
+            status,
+        });
+    }
+    response.text().await.map_err(|source| Error::Web {
+        url: url.to_string(),
+        source,
+    })
+}
+
+fn diff_download_url(diff_text_link: &str) -> Result<Url> {
+    let base_url = api_base_url()?;
+    let base = Url::parse(&base_url).map_err(|source| Error::Url {
+        url: base_url,
+        source,
+    })?;
+    let mut url = Url::parse(diff_text_link).map_err(|source| Error::Url {
+        url: diff_text_link.to_owned(),
+        source,
+    })?;
+    let base_path = base.path().trim_end_matches('/');
+    let path_matches = base_path.is_empty()
+        || url.path() == base_path
+        || url
+            .path()
+            .strip_prefix(base_path)
+            .is_some_and(|path| path.starts_with('/'));
+    if url.scheme() != base.scheme()
+        || url.host_str() != base.host_str()
+        || url.port_or_known_default() != base.port_or_known_default()
+        || !path_matches
+    {
+        return Err(Error::invalid(
+            "preview diff text URL is outside the configured Launchpad API",
+        ));
+    }
+
+    let web_host = match base.host_str() {
+        Some("api.launchpad.net") => Some("code.launchpad.net"),
+        Some("api.staging.launchpad.net") => Some("code.staging.launchpad.net"),
+        Some("api.qastaging.launchpad.net") => Some("code.qastaging.launchpad.net"),
+        _ => None,
+    };
+    if let Some(web_host) = web_host {
+        let relative_path = url
+            .path()
+            .strip_prefix(base_path)
+            .and_then(|path| path.strip_suffix("/diff_text"))
+            .ok_or_else(|| Error::invalid("preview diff text URL has an invalid path"))?;
+        let path = format!("{relative_path}/+files/preview.diff");
+        url.set_host(Some(web_host))
+            .map_err(|_| Error::invalid("preview diff text URL has an invalid host"))?;
+        url.set_path(&path);
+        url.set_query(None);
+    }
+    Ok(url)
+}
+
+async fn inline_comments(
+    client: &LaunchpadClient,
+    proposal: &Value,
+    preview_diff_id: u64,
+) -> Result<Vec<Value>> {
+    let url = review_operation_url(proposal, "getInlineComments", preview_diff_id)?;
+    let comments: Value = client.get_url(url.as_str()).await?;
+    comments
+        .as_array()
+        .cloned()
+        .ok_or_else(|| Error::invalid("Launchpad returned invalid inline comments"))
+}
+
+async fn review_drafts(
+    client: &LaunchpadClient,
+    proposal: &Value,
+    preview_diff_id: u64,
+) -> Result<Value> {
+    let url = review_operation_url(proposal, "getDraftInlineComments", preview_diff_id)?;
+    let drafts: Value = client.get_url(url.as_str()).await?;
+    if drafts.is_null() {
+        return Ok(json!({}));
+    }
+    let Some(drafts) = drafts.as_object() else {
+        return Err(Error::invalid("Launchpad returned invalid review drafts"));
+    };
+    if drafts
+        .iter()
+        .any(|(line, body)| line.parse::<usize>().is_err() || !body.is_string())
+    {
+        return Err(Error::invalid("Launchpad returned invalid review drafts"));
+    }
+    Ok(Value::Object(drafts.clone()))
+}
+
+async fn save_review_drafts(
+    client: &LaunchpadClient,
+    proposal: &Value,
+    preview_diff_id: u64,
+    drafts: &Value,
+) -> Result<()> {
+    let url = proposal_api_url(proposal)?;
+    let preview_diff_id = preview_diff_id.to_string();
+    let drafts = drafts.to_string();
+    client
+        .post_pairs_url_ok(
+            url.as_str(),
+            &[
+                ("ws.op", "saveDraftInlineComment"),
+                ("previewdiff_id", preview_diff_id.as_str()),
+                ("comments", drafts.as_str()),
+            ],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn create_inline_review(
+    client: &LaunchpadClient,
+    proposal: &Value,
+    preview_diff_id: u64,
+    content: &str,
+    drafts: &Value,
+    vote: Option<&str>,
+) -> Result<()> {
+    let url = proposal_api_url(proposal)?;
+    let preview_diff_id = preview_diff_id.to_string();
+    let drafts = drafts.to_string();
+    let mut parameters = vec![
+        ("ws.op", "createComment"),
+        ("content", content),
+        ("previewdiff_id", preview_diff_id.as_str()),
+        ("inline_comments", drafts.as_str()),
+    ];
+    if let Some(vote) = vote {
+        parameters.push(("vote", vote));
+    }
+    client.post_pairs_url_ok(url.as_str(), &parameters).await?;
+    Ok(())
+}
+
+async fn enforce_current_preview_diff(
+    client: &LaunchpadClient,
+    proposal: &Value,
+    requested_id: u64,
+) -> Result<Value> {
+    let current = get_preview_diff(client, proposal, None).await?;
+    validate_current_preview_diff(&current, requested_id)?;
+    Ok(current)
+}
+
+fn validate_current_preview_diff(current: &Value, requested_id: u64) -> Result<()> {
+    let current_id = preview_diff_id(current)?;
+    if requested_id != current_id {
+        return Err(Error::invalid(format!(
+            "preview diff {requested_id} is stale; current preview diff is {current_id}"
+        )));
+    }
+    if current.get("stale").and_then(Value::as_bool) == Some(true) {
+        return Err(Error::invalid(format!(
+            "preview diff {requested_id} is marked stale"
+        )));
+    }
+    Ok(())
+}
+
+fn review_operation_url(proposal: &Value, operation: &str, preview_diff_id: u64) -> Result<Url> {
+    let mut url = proposal_api_url(proposal)?;
+    url.query_pairs_mut()
+        .append_pair("ws.op", operation)
+        .append_pair("previewdiff_id", &preview_diff_id.to_string());
+    Ok(url)
+}
+
+fn proposal_api_url(proposal: &Value) -> Result<Url> {
+    let self_link = render::text_field(proposal, "self_link")
+        .ok_or_else(|| Error::invalid("merge proposal has no API link"))?;
+    Url::parse(self_link).map_err(|source| Error::Url {
+        url: self_link.to_owned(),
+        source,
+    })
+}
+
+async fn fetch_all_entries(client: &LaunchpadClient, first_url: &str) -> Result<Vec<Value>> {
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+    let mut url = first_url.to_owned();
+    loop {
+        if !seen.insert(url.clone()) {
+            return Err(Error::invalid(
+                "Launchpad collection pagination repeated a page",
+            ));
+        }
+        let page: Collection<Value> = client.get_url(&url).await?;
+        entries.extend(page.entries);
+        let Some(next_url) = page.next_collection_link else {
+            break;
+        };
+        url = next_url;
+    }
+    Ok(entries)
 }
 
 async fn fetch_entries(
@@ -640,4 +1112,33 @@ fn floor_char_boundary(value: &str, index: usize) -> usize {
         index -= 1;
     }
     index
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::validate_current_preview_diff;
+
+    #[test]
+    fn rejects_non_current_preview_diff() {
+        let current = json!({ "id": 102, "stale": false });
+        let error = validate_current_preview_diff(&current, 101).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("preview diff 101 is stale; current preview diff is 102")
+        );
+    }
+
+    #[test]
+    fn rejects_current_preview_diff_marked_stale() {
+        let current = json!({ "id": 102, "stale": true });
+        let error = validate_current_preview_diff(&current, 102).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("preview diff 102 is marked stale")
+        );
+    }
 }

@@ -1,3 +1,4 @@
+mod diff;
 mod error;
 mod launchpad;
 mod local_git;

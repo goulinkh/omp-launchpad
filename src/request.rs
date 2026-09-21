@@ -4,10 +4,19 @@ use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use url::Url;
 
+use crate::diff::DiffSide;
 use crate::error::Error;
 use crate::result::Result;
 
 const MAX_COMMENTS: usize = 20;
+const REVIEW_VOTES: &[&str] = &[
+    "Approve",
+    "Needs Fixing",
+    "Needs Information",
+    "Abstain",
+    "Disapprove",
+    "Needs Resubmitting",
+];
 const MAX_RESULTS: usize = 50;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -18,9 +27,15 @@ pub enum Operation {
     FileRead,
     SearchBugs,
     SearchMergeProposals,
+    PreviewDiffs,
+    InlineComments,
+    ReviewDrafts,
+    DiffLineMap,
     BugCreate,
     MergeProposalCreate,
     Comment,
+    ReviewDraftUpdate,
+    ReviewSubmit,
     SetMergeProposalStatus,
     MergeProposalCheckout,
     MergeProposalPush,
@@ -30,9 +45,12 @@ impl Operation {
     pub fn requires_authentication(self) -> bool {
         matches!(
             self,
-            Self::BugCreate
+            Self::ReviewDrafts
+                | Self::BugCreate
                 | Self::MergeProposalCreate
                 | Self::Comment
+                | Self::ReviewDraftUpdate
+                | Self::ReviewSubmit
                 | Self::SetMergeProposalStatus
         )
     }
@@ -77,6 +95,9 @@ pub struct Request {
     pub importance: Option<OneOrMany>,
     pub tags: Option<Vec<String>>,
     pub limit: Option<usize>,
+    pub preview_diff_id: Option<u64>,
+    pub file_line: Option<u64>,
+    pub side: Option<DiffSide>,
     pub title: Option<String>,
     pub description: Option<String>,
     pub information_type: Option<String>,
@@ -99,6 +120,13 @@ impl Request {
             Operation::FileRead => &[("repository", &self.repository), ("path", &self.path)],
             Operation::SearchBugs => &[("target", &self.target)],
             Operation::SearchMergeProposals => &[("repository", &self.repository)],
+            Operation::PreviewDiffs
+            | Operation::InlineComments
+            | Operation::ReviewDrafts
+            | Operation::ReviewSubmit => &[("target", &self.target)],
+            Operation::DiffLineMap | Operation::ReviewDraftUpdate => {
+                &[("target", &self.target), ("path", &self.path)]
+            }
             Operation::BugCreate => &[
                 ("target", &self.target),
                 ("title", &self.title),
@@ -122,8 +150,37 @@ impl Request {
                 )));
             }
         }
+        if matches!(
+            self.op,
+            Operation::InlineComments
+                | Operation::ReviewDrafts
+                | Operation::DiffLineMap
+                | Operation::ReviewDraftUpdate
+                | Operation::ReviewSubmit
+        ) {
+            self.preview_diff_id()?;
+        }
+        if matches!(
+            self.op,
+            Operation::DiffLineMap | Operation::ReviewDraftUpdate
+        ) {
+            self.file_line()?;
+            self.side()?;
+            validate_repository_path(self.path("path")?)?;
+        }
         if self.op == Operation::SetMergeProposalStatus {
             self.status()?;
+        }
+        if self.vote.is_some() {
+            self.vote()?;
+        }
+        if self.op == Operation::ReviewDraftUpdate
+            && self
+                .body
+                .as_deref()
+                .is_some_and(|body| body.trim().is_empty())
+        {
+            return Err(Error::invalid("draft body cannot be empty"));
         }
         if self.limit == Some(0) {
             return Err(Error::invalid("limit must be greater than zero"));
@@ -157,6 +214,48 @@ impl Request {
         self.limit.unwrap_or(10).min(MAX_RESULTS)
     }
 
+    pub fn preview_diff_id(&self) -> Result<u64> {
+        if self.preview_diff_id == Some(0) {
+            return Err(Error::invalid("preview_diff_id must be greater than zero"));
+        }
+        let target_id = self
+            .target
+            .as_deref()
+            .map(ResourceTarget::parse)
+            .transpose()?
+            .and_then(|target| target.preview_diff_id);
+        if self
+            .preview_diff_id
+            .zip(target_id)
+            .is_some_and(|(parameter_id, target_id)| parameter_id != target_id)
+        {
+            return Err(Error::invalid(
+                "target and preview_diff_id select different snapshots",
+            ));
+        }
+        self.preview_diff_id
+            .or(target_id)
+            .ok_or_else(|| Error::invalid(format!("preview_diff_id is required for {:?}", self.op)))
+    }
+
+    pub fn file_line(&self) -> Result<u64> {
+        self.file_line
+            .filter(|line| *line > 0)
+            .ok_or_else(|| Error::invalid(format!("file_line is required for {:?}", self.op)))
+    }
+
+    pub fn side(&self) -> Result<DiffSide> {
+        self.side
+            .ok_or_else(|| Error::invalid(format!("side is required for {:?}", self.op)))
+    }
+
+    pub fn vote(&self) -> Result<&str> {
+        self.vote
+            .as_deref()
+            .filter(|vote| REVIEW_VOTES.contains(vote))
+            .ok_or_else(|| Error::invalid("vote is not a supported Launchpad review vote"))
+    }
+
     pub fn status(&self) -> Result<&str> {
         match &self.status {
             Some(OneOrMany::One(status)) if !status.trim().is_empty() => Ok(status),
@@ -183,6 +282,7 @@ pub struct ResourceTarget {
     pub include_comments: bool,
     pub comment_limit: usize,
     pub diff: bool,
+    pub preview_diff_id: Option<u64>,
 }
 
 impl ResourceTarget {
@@ -203,7 +303,26 @@ impl ResourceTarget {
             })
             .transpose()?
             .unwrap_or(MAX_COMMENTS);
-        let (path, diff) = strip_diff_suffix(path);
+        let query_preview_diff_id = query
+            .iter()
+            .find(|(name, _)| name == "preview_diff")
+            .map(|(_, value)| parse_positive_id(value, "preview_diff"))
+            .transpose()?;
+        let (path, diff, path_preview_diff_id) = strip_diff_suffix(path)?;
+        if query_preview_diff_id.is_some()
+            && path_preview_diff_id.is_some()
+            && query_preview_diff_id != path_preview_diff_id
+        {
+            return Err(Error::invalid(
+                "preview diff path and preview_diff query select different snapshots",
+            ));
+        }
+        let preview_diff_id = query_preview_diff_id.or(path_preview_diff_id);
+        if preview_diff_id.is_some() && !diff {
+            return Err(Error::invalid(
+                "preview_diff is only valid for a merge proposal diff",
+            ));
+        }
         let path = normalise_bug_path(path);
         let kind = classify_resource(&path)?;
         Ok(Self {
@@ -212,6 +331,7 @@ impl ResourceTarget {
             include_comments,
             comment_limit,
             diff,
+            preview_diff_id,
         })
     }
 }
@@ -268,13 +388,25 @@ fn split_target(raw: &str) -> Result<(String, Vec<(String, String)>)> {
     Ok((raw.trim_start_matches('/').to_owned(), Vec::new()))
 }
 
-fn strip_diff_suffix(path: String) -> (String, bool) {
+fn strip_diff_suffix(path: String) -> Result<(String, bool, Option<u64>)> {
     for suffix in ["/diff/all", "/diff"] {
         if let Some(path) = path.strip_suffix(suffix) {
-            return (path.to_owned(), true);
+            return Ok((path.to_owned(), true, None));
         }
     }
-    (path, false)
+    if let Some((path, id)) = path.rsplit_once("/diff/") {
+        let id = parse_positive_id(id, "preview diff path")?;
+        return Ok((path.to_owned(), true, Some(id)));
+    }
+    Ok((path, false, None))
+}
+
+fn parse_positive_id(value: &str, name: &str) -> Result<u64> {
+    value
+        .parse()
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| Error::invalid(format!("{name} must be a positive integer")))
 }
 
 fn normalise_bug_path(path: String) -> String {
@@ -311,7 +443,7 @@ fn classify_resource(path: &str) -> Result<ResourceKind> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResourceKind, ResourceTarget, validate_repository_path};
+    use super::{Request, ResourceKind, ResourceTarget, validate_repository_path};
 
     #[test]
     fn parses_bug_url_options() {
@@ -333,6 +465,45 @@ mod tests {
             }
         );
         assert!(target.diff);
+    }
+
+    #[test]
+    fn parses_explicit_preview_diff() {
+        let target =
+            ResourceTarget::parse("lp://~owner/project/+git/repository/+merge/42/diff/17").unwrap();
+        assert!(target.diff);
+        assert_eq!(target.preview_diff_id, Some(17));
+    }
+
+    #[test]
+    fn uses_preview_diff_from_target() {
+        let request: Request = serde_json::from_str(
+            r#"{
+                "op": "inline_comments",
+                "target": "lp://~owner/project/+git/repository/+merge/42/diff/17"
+            }"#,
+        )
+        .unwrap();
+        request.validate().unwrap();
+        assert_eq!(request.preview_diff_id().unwrap(), 17);
+    }
+
+    #[test]
+    fn rejects_conflicting_preview_diff_selectors() {
+        let request: Request = serde_json::from_str(
+            r#"{
+                "op": "inline_comments",
+                "target": "lp://~owner/project/+git/repository/+merge/42/diff/17",
+                "preview_diff_id": 18
+            }"#,
+        )
+        .unwrap();
+        let error = request.validate().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("target and preview_diff_id select different snapshots")
+        );
     }
 
     #[test]
