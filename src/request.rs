@@ -29,6 +29,7 @@ pub enum Operation {
     SearchBugs,
     SearchMergeProposals,
     MergeProposalForBranch,
+    CurrentMergeProposal,
     MergeProposalDiscussion,
     PreviewDiffs,
     InlineComments,
@@ -83,6 +84,13 @@ impl OneOrMany {
             }
         }
     }
+
+    pub fn values(&self) -> impl Iterator<Item = &str> {
+        match self {
+            Self::One(value) => std::slice::from_ref(value).iter().map(String::as_str),
+            Self::Many(values) => values.iter().map(String::as_str),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -104,6 +112,15 @@ impl DiscussionComments {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscussionFormat {
+    #[default]
+    Summary,
+    Structured,
+    Both,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Request {
     pub op: Operation,
@@ -121,8 +138,12 @@ pub struct Request {
     pub current_diff_only: Option<bool>,
     pub unresolved_only: Option<bool>,
     pub comments: Option<DiscussionComments>,
+    pub format: Option<DiscussionFormat>,
     pub since: Option<String>,
     pub reviewer: Option<String>,
+    pub target_branch: Option<String>,
+    pub latest: Option<bool>,
+    pub include_superseded: Option<bool>,
     pub file_line: Option<u64>,
     pub side: Option<DiffSide>,
     pub title: Option<String>,
@@ -147,7 +168,9 @@ impl Request {
             Operation::FileRead => &[("repository", &self.repository), ("path", &self.path)],
             Operation::SearchBugs => &[("target", &self.target)],
             Operation::SearchMergeProposals => &[("repository", &self.repository)],
-            Operation::MergeProposalForBranch | Operation::MergeProposalDiscussion => &[],
+            Operation::MergeProposalForBranch
+            | Operation::CurrentMergeProposal
+            | Operation::MergeProposalDiscussion => &[],
             Operation::PreviewDiffs
             | Operation::InlineComments
             | Operation::ReviewDrafts
@@ -172,8 +195,17 @@ impl Request {
         };
         match self.op {
             Operation::MergeProposalForBranch => self.validate_branch_selector(false)?,
+            Operation::CurrentMergeProposal => self.validate_current_selector()?,
             Operation::MergeProposalDiscussion => self.validate_branch_selector(true)?,
             _ => {}
+        }
+        if matches!(
+            self.op,
+            Operation::MergeProposalForBranch
+                | Operation::CurrentMergeProposal
+                | Operation::MergeProposalDiscussion
+        ) {
+            self.validate_proposal_selection()?;
         }
         for (name, value) in required {
             if value.as_deref().is_none_or(str::is_empty) {
@@ -229,11 +261,27 @@ impl Request {
         let has_discussion_filters = self.current_diff_only.is_some()
             || self.unresolved_only.is_some()
             || self.comments.is_some()
+            || self.format.is_some()
             || self.since.is_some()
             || self.reviewer.is_some();
         if has_discussion_filters && self.op != Operation::MergeProposalDiscussion {
             return Err(Error::invalid(
-                "comment filters are supported only for merge_proposal_discussion",
+                "discussion filters and format are supported only for merge_proposal_discussion",
+            ));
+        }
+        let has_selection_filters = self.target_branch.is_some()
+            || self.latest.is_some()
+            || self.include_superseded.is_some();
+        if has_selection_filters
+            && !matches!(
+                self.op,
+                Operation::MergeProposalForBranch
+                    | Operation::CurrentMergeProposal
+                    | Operation::MergeProposalDiscussion
+            )
+        {
+            return Err(Error::invalid(
+                "proposal selection filters are supported only for branch and current merge proposal lookup",
             ));
         }
         if self.comments == Some(DiscussionComments::General)
@@ -343,6 +391,32 @@ impl Request {
             .transpose()
     }
 
+    fn validate_current_selector(&self) -> Result<()> {
+        if self.target.is_some() || self.repository.is_some() || self.branch.is_some() {
+            return Err(Error::invalid(
+                "current_merge_proposal uses the current Git checkout; omit target, repository, and branch",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_proposal_selection(&self) -> Result<()> {
+        if self
+            .target_branch
+            .as_deref()
+            .is_some_and(|branch| branch.trim().is_empty())
+        {
+            return Err(Error::invalid("target_branch cannot be empty"));
+        }
+        if self.status.as_ref().is_some_and(|statuses| {
+            let values = statuses.values().collect::<Vec<_>>();
+            values.is_empty() || values.iter().any(|status| status.trim().is_empty())
+        }) {
+            return Err(Error::invalid("status filters cannot be empty"));
+        }
+        Ok(())
+    }
+
     fn validate_branch_selector(&self, allow_target: bool) -> Result<()> {
         let has_target = self
             .target
@@ -367,6 +441,15 @@ impl Request {
             if has_repository || has_branch {
                 return Err(Error::invalid(
                     "target cannot be combined with repository or branch",
+                ));
+            }
+            if self.status.is_some()
+                || self.target_branch.is_some()
+                || self.latest.is_some()
+                || self.include_superseded.is_some()
+            {
+                return Err(Error::invalid(
+                    "proposal selection filters cannot be combined with an explicit target",
                 ));
             }
             return Ok(());
@@ -453,6 +536,7 @@ fn repository_path_from_url(raw: &str) -> Result<String> {
 pub enum ResourceKind {
     Bug { id: u64 },
     MergeProposal { repository: String, id: u64 },
+    MergeProposalId { id: u64 },
     Repository,
     Generic,
 }
@@ -609,12 +693,15 @@ fn classify_resource(path: &str) -> Result<ResourceKind> {
         return Ok(ResourceKind::Bug { id });
     }
     if let Some((repository, id)) = path.rsplit_once("/+merge/") {
-        let id = id
-            .parse()
-            .map_err(|_| Error::invalid("merge proposal target must end with a numeric ID"))?;
+        let id = parse_positive_id(id, "merge proposal target")?;
         return Ok(ResourceKind::MergeProposal {
             repository: repository.to_owned(),
             id,
+        });
+    }
+    if path.bytes().all(|byte| byte.is_ascii_digit()) && !path.is_empty() {
+        return Ok(ResourceKind::MergeProposalId {
+            id: parse_positive_id(path, "merge proposal ID")?,
         });
     }
     if path.contains("/+git/") {
@@ -626,8 +713,8 @@ fn classify_resource(path: &str) -> Result<ResourceKind> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DiscussionComments, Request, ResourceKind, ResourceTarget, normalise_repository,
-        validate_repository_path,
+        DiscussionComments, DiscussionFormat, Request, ResourceKind, ResourceTarget,
+        normalise_repository, validate_repository_path,
     };
 
     #[test]
@@ -650,6 +737,12 @@ mod tests {
             }
         );
         assert!(target.diff);
+    }
+
+    #[test]
+    fn parses_numeric_merge_proposal_id() {
+        let target = ResourceTarget::parse("511601").unwrap();
+        assert_eq!(target.kind, ResourceKind::MergeProposalId { id: 511601 });
     }
 
     #[test]
@@ -778,6 +871,10 @@ mod tests {
         .unwrap();
         request.validate().unwrap();
         assert_eq!(request.comments, Some(DiscussionComments::Inline));
+        assert_eq!(
+            request.format.unwrap_or_default(),
+            DiscussionFormat::Summary
+        );
         assert!(request.since().unwrap().is_some());
 
         let invalid_timestamp: Request = serde_json::from_str(

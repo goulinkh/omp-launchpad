@@ -17,7 +17,8 @@ use crate::error::Error;
 use crate::local_git::{self, CheckoutSpec};
 use crate::render;
 use crate::request::{
-    OneOrMany, Operation, Request, ResourceKind, ResourceTarget, normalise_repository,
+    DiscussionFormat, OneOrMany, Operation, Request, ResourceKind, ResourceTarget,
+    normalise_repository,
 };
 use crate::response::OperationResult;
 use crate::result::Result;
@@ -43,6 +44,7 @@ pub async fn execute(request: &Request) -> Result<OperationResult> {
         Operation::SearchBugs => search_bugs(&client, request).await,
         Operation::SearchMergeProposals => search_merge_proposals(&client, request).await,
         Operation::MergeProposalForBranch => view_merge_proposal_for_branch(&client, request).await,
+        Operation::CurrentMergeProposal => view_current_merge_proposal(&client, request).await,
         Operation::MergeProposalDiscussion => {
             view_merge_proposal_discussion(&client, request).await
         }
@@ -130,6 +132,10 @@ async fn view_resource(client: &LaunchpadClient, request: &Request) -> Result<Op
         ResourceKind::MergeProposal { repository, id } => {
             view_merge_proposal(client, &target, repository, *id).await
         }
+        ResourceKind::MergeProposalId { .. } => {
+            let (_, proposal) = resolve_merge_proposal_target(client, request.target()?).await?;
+            view_merge_proposal_value(client, &target, proposal).await
+        }
         ResourceKind::Repository => {
             let repository = get_repository(client, &target.path).await?;
             let source_url = render::text_field(&repository, "web_link").map(str::to_owned);
@@ -201,6 +207,14 @@ async fn view_merge_proposal(
     id: u64,
 ) -> Result<OperationResult> {
     let proposal = get_merge_proposal(client, repository, id).await?;
+    view_merge_proposal_value(client, target, proposal).await
+}
+
+async fn view_merge_proposal_value(
+    client: &LaunchpadClient,
+    target: &ResourceTarget,
+    proposal: Value,
+) -> Result<OperationResult> {
     let source_url = render::text_field(&proposal, "web_link").map(str::to_owned);
     if target.diff {
         let preview_diff = get_preview_diff(client, &proposal, target.preview_diff_id).await?;
@@ -222,20 +236,16 @@ async fn view_merge_proposal(
             .with_source_url(source_url)
             .with_details(details));
     }
+    let comments_url = render::text_field(&proposal, "all_comments_collection_link")
+        .ok_or_else(|| Error::invalid("merge proposal has no comments collection"))?;
     let comments = if target.include_comments {
-        fetch_entries(
-            client,
-            &client.url(&format!("/{repository}/+merge/{id}/all_comments")),
-            target.comment_limit,
-        )
-        .await?
+        fetch_entries(client, comments_url, target.comment_limit).await?
     } else {
         Vec::new()
     };
     let votes_url = render::text_field(&proposal, "votes_collection_link")
-        .map(str::to_owned)
-        .unwrap_or_else(|| client.url(&format!("/{repository}/+merge/{id}/votes")));
-    let votes = fetch_entries(client, &votes_url, MAX_ITEMS)
+        .ok_or_else(|| Error::invalid("merge proposal has no review vote collection"))?;
+    let votes = fetch_entries(client, votes_url, MAX_ITEMS)
         .await
         .unwrap_or_default();
     let text = render::render_proposal(
@@ -417,37 +427,103 @@ async fn view_merge_proposal_for_branch(
     request: &Request,
 ) -> Result<OperationResult> {
     let (requested_repository, branch, inferred) = branch_selector(request).await?;
-    let (repository, proposal, alternatives, related_repository) =
-        merge_proposal_for_branch(client, &requested_repository, &branch).await?;
-    let match_count = alternatives.len() + 1;
-    let canonical_repository = render::text_field(&repository, "unique_name")
-        .unwrap_or(repository_identifier(&repository));
-    let source_url = render::text_field(&proposal, "web_link").map(str::to_owned);
-    let resolution = if inferred {
+    let selection =
+        merge_proposal_for_branch(client, &requested_repository, &branch, request).await?;
+    proposal_lookup_result(
+        client,
+        request,
+        selection,
+        ProposalLookupContext {
+            requested_repository: &requested_repository,
+            branch: &branch,
+            inferred,
+            kind: "merge_proposal_for_branch",
+            metadata: None,
+        },
+    )
+    .await
+}
+
+async fn view_current_merge_proposal(
+    client: &LaunchpadClient,
+    request: &Request,
+) -> Result<OperationResult> {
+    let current = local_git::current_repository().await?;
+    let requested_repository = normalise_repository(&current.selected_remote.url)?;
+    let selection =
+        merge_proposal_for_branch(client, &requested_repository, &current.branch, request).await?;
+    let context = json!({
+        "working_directory": current.working_directory,
+        "selected_remote": {
+            "name": current.selected_remote.name,
+            "url": current.selected_remote.url,
+        },
+        "inspected_remotes": current.remotes.into_iter().map(|remote| {
+            json!({ "name": remote.name, "url": remote.url })
+        }).collect::<Vec<_>>(),
+    });
+    proposal_lookup_result(
+        client,
+        request,
+        selection,
+        ProposalLookupContext {
+            requested_repository: &requested_repository,
+            branch: &current.branch,
+            inferred: true,
+            kind: "current_merge_proposal",
+            metadata: Some(context),
+        },
+    )
+    .await
+}
+
+struct ProposalLookupContext<'value> {
+    requested_repository: &'value str,
+    branch: &'value str,
+    inferred: bool,
+    kind: &'value str,
+    metadata: Option<Value>,
+}
+
+async fn proposal_lookup_result(
+    client: &LaunchpadClient,
+    request: &Request,
+    selection: ProposalSelection,
+    context: ProposalLookupContext<'_>,
+) -> Result<OperationResult> {
+    let canonical_repository = render::text_field(&selection.repository, "unique_name")
+        .unwrap_or(repository_identifier(&selection.repository));
+    let source_url = render::text_field(&selection.proposal, "web_link").map(str::to_owned);
+    let resolution = if context.inferred {
         "current Git checkout"
-    } else if related_repository {
+    } else if selection.related_repository {
         "related target repository"
     } else {
         "explicit repository and branch"
     };
     let text = render::render_proposal_lookup(
-        &proposal,
-        &alternatives,
+        &selection.proposal,
+        &selection.alternatives,
         canonical_repository,
-        &normalise_ref(&branch),
+        &normalise_ref(context.branch),
         resolution,
+        &selection.reason,
     );
-    let proposal_details = proposal_details(client, &proposal).await?;
+    let selected_proposal = proposal_details(client, &selection.proposal).await?;
     let details = json!({
-        "kind": "merge_proposal_for_branch",
+        "kind": context.kind,
         "repository": canonical_repository,
-        "requested_repository": requested_repository,
-        "branch": normalise_ref(&branch),
-        "inferred": inferred,
-        "related_repository": related_repository,
-        "matching_proposals": match_count,
-        "proposal": proposal_details,
-        "other_proposals": alternatives.iter().map(proposal_summary).collect::<Vec<_>>(),
+        "requested_repository": context.requested_repository,
+        "branch": normalise_ref(context.branch),
+        "inferred": context.inferred,
+        "related_repository": selection.related_repository,
+        "candidate_count": selection.candidate_count,
+        "matching_proposals": selection.alternatives.len() + 1,
+        "selected_proposal": selected_proposal,
+        "selection_reason": selection.reason,
+        "selection_filters": proposal_selection_filters(request),
+        "other_proposals": selection.alternatives.iter().map(proposal_summary).collect::<Vec<_>>(),
+        "context": context.metadata,
     });
     Ok(OperationResult::new(text)
         .with_source_url(source_url)
@@ -462,25 +538,30 @@ async fn view_merge_proposal_discussion(
         .target
         .as_deref()
         .is_some_and(|target| !target.trim().is_empty());
-    let (proposal, lookup) = if has_target {
+    let (proposal, lookup, selection_reason) = if has_target {
         let (_, proposal) = request_merge_proposal(client, request).await?;
-        (proposal, None)
+        (
+            proposal,
+            None,
+            "selected the explicitly requested merge proposal".to_owned(),
+        )
     } else {
         let (requested_repository, branch, inferred) = branch_selector(request).await?;
-        let (repository, proposal, alternatives, related_repository) =
-            merge_proposal_for_branch(client, &requested_repository, &branch).await?;
-        let match_count = alternatives.len() + 1;
-        let canonical_repository = render::text_field(&repository, "unique_name")
-            .unwrap_or(repository_identifier(&repository));
+        let selection =
+            merge_proposal_for_branch(client, &requested_repository, &branch, request).await?;
+        let canonical_repository = render::text_field(&selection.repository, "unique_name")
+            .unwrap_or(repository_identifier(&selection.repository));
         let lookup = json!({
             "repository": canonical_repository,
             "requested_repository": requested_repository,
             "branch": normalise_ref(&branch),
             "inferred": inferred,
-            "related_repository": related_repository,
-            "matching_proposals": match_count,
+            "related_repository": selection.related_repository,
+            "candidate_count": selection.candidate_count,
+            "matching_proposals": selection.alternatives.len() + 1,
+            "selection_filters": proposal_selection_filters(request),
         });
-        (proposal, Some(lookup))
+        (selection.proposal, Some(lookup), selection.reason)
     };
 
     let comments_kind = request.comments.unwrap_or_default();
@@ -674,14 +755,17 @@ async fn view_merge_proposal_discussion(
             })
         })
         .collect::<Vec<_>>();
-    let source_url = render::text_field(&proposal, "web_link").map(str::to_owned);
-    let markdown = render::render_proposal_discussion(
-        &proposal,
+    let review_summary = build_review_summary(
         &general_comments,
         &review_votes,
         &review_requests,
-        &diff_discussions,
+        &inline_threads,
+    );
+    let source_url = render::text_field(&proposal, "web_link").map(str::to_owned);
+    let markdown = render::render_proposal_discussion(
+        &proposal,
         current_preview_diff_id,
+        &review_summary,
         render::DiscussionSections {
             general: comments_kind.includes_general(),
             inline: comments_kind.includes_inline(),
@@ -698,13 +782,16 @@ async fn view_merge_proposal_discussion(
     } else {
         "all_preview_diffs"
     };
+    let format = request.format.unwrap_or_default();
     let details = json!({
         "kind": "merge_proposal_discussion",
-        "proposal": proposal_details(client, &proposal).await?,
+        "selected_proposal": proposal_details(client, &proposal).await?,
+        "selection_reason": selection_reason,
         "lookup": lookup,
         "current_preview_diff_id": current_preview_diff_id,
         "current_preview_diff_stale": current_preview_diff_stale,
         "coverage": coverage,
+        "format": format,
         "filters": {
             "comments": comments_kind,
             "current_diff_only": request.current_diff_only.unwrap_or_default(),
@@ -712,6 +799,7 @@ async fn view_merge_proposal_discussion(
             "since": request.since.as_deref(),
             "reviewer": reviewer,
         },
+        "review_summary": review_summary,
         "identity_resolution_failures": identity_resolution_failures.len(),
         "review_votes": review_votes,
         "general_comments": general_comments,
@@ -719,10 +807,25 @@ async fn view_merge_proposal_discussion(
         "inline_threads": inline_threads,
         "preview_diffs": preview_diff_summaries,
     });
-    let text = format!("{markdown}\n\n## Structured data\n\n```json\n{details}\n```");
+    let text = match format {
+        DiscussionFormat::Summary => markdown,
+        DiscussionFormat::Structured => details.to_string(),
+        DiscussionFormat::Both => {
+            format!("{markdown}\n\n## Structured data\n\n```json\n{details}\n```")
+        }
+    };
     Ok(OperationResult::new(text)
         .with_source_url(source_url)
         .with_details(details))
+}
+
+struct ProposalSelection {
+    repository: Value,
+    proposal: Value,
+    alternatives: Vec<Value>,
+    related_repository: bool,
+    reason: String,
+    candidate_count: usize,
 }
 
 async fn branch_selector(request: &Request) -> Result<(String, String, bool)> {
@@ -750,14 +853,24 @@ async fn merge_proposal_for_branch(
     client: &LaunchpadClient,
     repository_path: &str,
     branch: &str,
-) -> Result<(Value, Value, Vec<Value>, bool)> {
+    request: &Request,
+) -> Result<ProposalSelection> {
     let repository = get_repository(client, repository_path).await?;
     let branch = normalise_ref(branch);
     let (proposals, requested_fallback_capped) =
         repository_branch_proposals(client, &repository, &branch).await?;
-    if !proposals.is_empty() {
-        let (proposal, alternatives) = select_proposal(proposals)?;
-        return Ok((repository, proposal, alternatives, false));
+    let requested_candidate_count = proposals.len();
+    let eligible = eligible_proposals(proposals, request);
+    if !eligible.is_empty() {
+        let (proposal, alternatives, reason) = select_proposal(eligible, request)?;
+        return Ok(ProposalSelection {
+            repository,
+            proposal,
+            alternatives,
+            related_repository: false,
+            reason,
+            candidate_count: requested_candidate_count,
+        });
     }
 
     let target_link = render::text_field(&repository, "target_link")
@@ -767,6 +880,17 @@ async fn merge_proposal_for_branch(
         render::text_field(&repository, "unique_name").unwrap_or(repository_path);
     let (related_repositories, truncated) =
         target_repositories(client, target_link, repository_name).await?;
+    let mut inspected_repositories = Vec::new();
+    for candidate in &related_repositories {
+        if let Some(name) = render::text_field(candidate, "unique_name")
+            && name != canonical_repository
+            && !inspected_repositories
+                .iter()
+                .any(|inspected| inspected == name)
+        {
+            inspected_repositories.push(name.to_owned());
+        }
+    }
     let mut matches = stream::iter(related_repositories)
         .map(|related_repository| {
             let branch = branch.as_str();
@@ -778,8 +902,16 @@ async fn merge_proposal_for_branch(
                 }
                 match related_repository_branch_proposals(client, &related_repository, branch).await
                 {
-                    Ok(proposals) if !proposals.is_empty() => Some((related_repository, proposals)),
-                    Ok(_) | Err(_) => None,
+                    Ok(proposals) => {
+                        let candidate_count = proposals.len();
+                        let proposals = eligible_proposals(proposals, request);
+                        (!proposals.is_empty()).then_some((
+                            related_repository,
+                            proposals,
+                            candidate_count,
+                        ))
+                    }
+                    Err(_) => None,
                 }
             }
         })
@@ -788,15 +920,29 @@ async fn merge_proposal_for_branch(
         .collect::<Vec<_>>()
         .await;
 
-    if let Some(candidates) = ambiguous_branch_candidates(&matches, &branch) {
+    if matches.len() > 1 {
+        let candidates = matches
+            .iter()
+            .map(|(repository, proposals, _)| {
+                let repository =
+                    render::text_field(repository, "unique_name").unwrap_or("unknown repository");
+                let proposal_ids = proposals
+                    .iter()
+                    .filter_map(render::resource_id)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{repository}:{branch} (MP {proposal_ids})")
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
         return Err(Error::invalid(format!(
-            "branch {branch} matches merge proposals in multiple repositories: {candidates}; provide an explicit merge proposal target"
+            "cannot select a merge proposal for {canonical_repository}:{branch}; matching repositories: {candidates}; retry with a full merge proposal target or narrow with status and target_branch"
         )));
     }
-    let Some((repository, proposals)) = matches.pop() else {
+    let Some((repository, proposals, candidate_count)) = matches.pop() else {
         let requested_cap = if requested_fallback_capped {
             format!(
-                "; the requested repository search was limited to its newest {MAX_BRANCH_FALLBACK_ITEMS} proposals"
+                "; requested repository search was limited to its newest {MAX_BRANCH_FALLBACK_ITEMS} proposals"
             )
         } else {
             String::new()
@@ -808,12 +954,25 @@ async fn merge_proposal_for_branch(
         } else {
             String::new()
         };
+        let inspected = if inspected_repositories.is_empty() {
+            "none".to_owned()
+        } else {
+            inspected_repositories.join(", ")
+        };
         return Err(Error::invalid(format!(
-            "no merge proposal found for {canonical_repository}:{branch} or another repository for the same target{requested_cap}{related_cap}"
+            "cannot resolve a merge proposal for {canonical_repository}:{branch}; inspected repositories: {canonical_repository}, {inspected}; filters: {}; accepted syntax: repository plus branch, merge proposal ID from a Launchpad checkout, or lp://~owner/project/+git/repository/+merge/ID; retry with status, target_branch, include_superseded=true, or a full target{requested_cap}{related_cap}",
+            proposal_selection_filter_text(request)
         )));
     };
-    let (proposal, alternatives) = select_proposal(proposals)?;
-    Ok((repository, proposal, alternatives, true))
+    let (proposal, alternatives, reason) = select_proposal(proposals, request)?;
+    Ok(ProposalSelection {
+        repository,
+        proposal,
+        alternatives,
+        related_repository: true,
+        reason,
+        candidate_count: requested_candidate_count + candidate_count,
+    })
 }
 
 async fn repository_branch_proposals(
@@ -821,8 +980,12 @@ async fn repository_branch_proposals(
     repository: &Value,
     branch: &str,
 ) -> Result<(Vec<Value>, bool)> {
-    let canonical_repository = render::text_field(repository, "unique_name")
-        .ok_or_else(|| Error::invalid("Launchpad repository has no unique name"))?;
+    let canonical_repository = render::text_field(repository, "unique_name").ok_or_else(|| {
+        Error::invalid(format!(
+            "cannot inspect repository {}; Launchpad omitted its unique name; accepted syntax: lp:<project>, lp://~owner/project/+git/repository, or a git.launchpad.net URL; retry with the canonical repository path",
+            repository_identifier(repository)
+        ))
+    })?;
     let git_ref = list_git_refs(client, canonical_repository)
         .await?
         .into_iter()
@@ -880,25 +1043,6 @@ async fn related_repository_branch_proposals(
     Ok(proposals)
 }
 
-fn ambiguous_branch_candidates(matches: &[(Value, Vec<Value>)], branch: &str) -> Option<String> {
-    (matches.len() > 1).then(|| {
-        matches
-            .iter()
-            .map(|(repository, proposals)| {
-                let repository =
-                    render::text_field(repository, "unique_name").unwrap_or("unknown repository");
-                let proposal_ids = proposals
-                    .iter()
-                    .filter_map(render::resource_id)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{repository}:{branch} (MP {proposal_ids})")
-            })
-            .collect::<Vec<_>>()
-            .join("; ")
-    })
-}
-
 async fn target_repositories(
     client: &LaunchpadClient,
     target_link: &str,
@@ -927,12 +1071,84 @@ async fn target_repositories(
     Ok((repositories, truncated))
 }
 
-fn select_proposal(mut proposals: Vec<Value>) -> Result<(Value, Vec<Value>)> {
-    proposals.sort_by(|left, right| proposal_sort_key(left).cmp(&proposal_sort_key(right)));
+fn eligible_proposals(proposals: Vec<Value>, request: &Request) -> Vec<Value> {
+    let requested_statuses = request.status.as_ref();
+    let explicitly_requests_superseded = requested_statuses.is_some_and(|statuses| {
+        statuses
+            .values()
+            .any(|status| status.eq_ignore_ascii_case("Superseded"))
+    });
+    let include_superseded =
+        request.include_superseded.unwrap_or_default() || explicitly_requests_superseded;
+    let target_branch = request.target_branch.as_deref().map(normalise_ref);
+    proposals
+        .into_iter()
+        .filter(|proposal| {
+            let status = render::text_field(proposal, "queue_status").unwrap_or_default();
+            let status_matches = requested_statuses.is_none_or(|statuses| {
+                statuses
+                    .values()
+                    .any(|requested| requested.eq_ignore_ascii_case(status))
+            });
+            let target_matches = target_branch.as_deref().is_none_or(|target| {
+                render::text_field(proposal, "target_git_path") == Some(target)
+            });
+            status_matches
+                && target_matches
+                && (include_superseded || !status.eq_ignore_ascii_case("Superseded"))
+        })
+        .collect()
+}
+
+fn select_proposal(
+    mut proposals: Vec<Value>,
+    request: &Request,
+) -> Result<(Value, Vec<Value>, String)> {
+    let latest = request.latest.unwrap_or_default();
+    proposals.sort_by(|left, right| {
+        if latest {
+            proposal_sort_key(left).cmp(&proposal_sort_key(right))
+        } else {
+            proposal_selection_key(left).cmp(&proposal_selection_key(right))
+        }
+    });
     let proposal = proposals
         .pop()
         .ok_or_else(|| Error::invalid("cannot select a merge proposal from an empty result"))?;
-    Ok((proposal, proposals))
+    let status = render::text_field(&proposal, "queue_status").unwrap_or("unknown");
+    let reason = if latest {
+        "selected the latest matching proposal by creation date and ID".to_owned()
+    } else if is_active_proposal_status(status) {
+        "preferred an active proposal, then selected the newest by creation date and ID".to_owned()
+    } else if status.eq_ignore_ascii_case("Merged") {
+        "selected the newest merged proposal because no active proposal matched".to_owned()
+    } else {
+        format!(
+            "selected the newest {status} proposal because no active or merged proposal matched"
+        )
+    };
+    Ok((proposal, proposals, reason))
+}
+
+fn proposal_selection_key(proposal: &Value) -> (u8, &str, u64) {
+    let status = render::text_field(proposal, "queue_status").unwrap_or_default();
+    let priority = if is_active_proposal_status(status) {
+        3
+    } else if status.eq_ignore_ascii_case("Merged") {
+        2
+    } else if status.eq_ignore_ascii_case("Rejected") {
+        1
+    } else {
+        0
+    };
+    let (date, id) = proposal_sort_key(proposal);
+    (priority, date, id)
+}
+
+fn is_active_proposal_status(status: &str) -> bool {
+    !["Merged", "Rejected", "Superseded"]
+        .iter()
+        .any(|terminal| terminal.eq_ignore_ascii_case(status))
 }
 
 fn proposal_sort_key(proposal: &Value) -> (&str, u64) {
@@ -943,11 +1159,93 @@ fn proposal_sort_key(proposal: &Value) -> (&str, u64) {
     (date, id)
 }
 
+fn proposal_selection_filters(request: &Request) -> Value {
+    json!({
+        "status": request.status.as_ref().map(|statuses| statuses.values().collect::<Vec<_>>()),
+        "target_branch": request.target_branch.as_deref().map(normalise_ref),
+        "latest": request.latest.unwrap_or_default(),
+        "include_superseded": request.include_superseded.unwrap_or_default(),
+    })
+}
+
+fn proposal_selection_filter_text(request: &Request) -> String {
+    let filters = proposal_selection_filters(request);
+    serde_json::to_string(&filters).unwrap_or_else(|_| "{}".to_owned())
+}
+
 fn proposal_summary(proposal: &Value) -> Value {
     json!({
         "id": render::resource_id(proposal),
         "status": render::text_field(proposal, "queue_status"),
         "url": render::text_field(proposal, "web_link"),
+    })
+}
+
+fn build_review_summary(
+    general_comments: &[Value],
+    review_votes: &[Value],
+    review_requests: &[Value],
+    inline_threads: &[Value],
+) -> Value {
+    let mut vote_counts = BTreeMap::<String, usize>::new();
+    let mut previous_votes = BTreeMap::<String, String>::new();
+    let mut current_votes = BTreeMap::<String, Value>::new();
+    let mut transitions = Vec::new();
+    let mut ordered_votes = review_votes.iter().collect::<Vec<_>>();
+    ordered_votes.sort_by_key(|vote| render::text_field(vote, "created_at"));
+    for vote in ordered_votes {
+        let Some(value) = render::text_field(vote, "vote") else {
+            continue;
+        };
+        let reviewer = vote
+            .get("author")
+            .and_then(|author| render::text_field(author, "username"))
+            .unwrap_or("unknown")
+            .to_owned();
+        *vote_counts.entry(value.to_owned()).or_default() += 1;
+        let previous = previous_votes.insert(reviewer.clone(), value.to_owned());
+        if previous
+            .as_deref()
+            .is_some_and(|previous| previous != value)
+        {
+            transitions.push(json!({
+                "reviewer": reviewer.clone(),
+                "from": previous,
+                "to": value,
+                "at": render::text_field(vote, "created_at"),
+            }));
+        }
+        current_votes.insert(
+            reviewer.clone(),
+            json!({
+                "reviewer": reviewer,
+                "vote": value,
+                "at": render::text_field(vote, "created_at"),
+            }),
+        );
+    }
+    let state_count = |state: &str| {
+        inline_threads
+            .iter()
+            .filter(|thread| render::text_field(thread, "state") == Some(state))
+            .count()
+    };
+    json!({
+        "general_comment_count": general_comments.len(),
+        "inline_thread_count": inline_threads.len(),
+        "current_open_inline_thread_count": state_count("open"),
+        "outdated_inline_thread_count": state_count("outdated"),
+        "superseded_inline_thread_count": state_count("superseded"),
+        "resolved_inline_thread_count": Value::Null,
+        "resolution_tracking": "Launchpad does not expose resolved inline-thread state",
+        "review_request_count": review_requests.len(),
+        "pending_review_request_count": review_requests.iter().filter(|request| {
+            request.get("pending").and_then(Value::as_bool).unwrap_or_default()
+        }).count(),
+        "review_vote_count": review_votes.len(),
+        "review_vote_counts": vote_counts,
+        "current_review_votes": current_votes.into_values().collect::<Vec<_>>(),
+        "review_vote_transitions": transitions,
     })
 }
 
@@ -1213,7 +1511,7 @@ async fn create_merge_proposal(
 async fn add_comment(client: &LaunchpadClient, request: &Request) -> Result<OperationResult> {
     let target = ResourceTarget::parse(request.target()?)?;
     let body = request.string(&request.body, "body")?;
-    let kind = match target.kind {
+    let (kind, source_url) = match &target.kind {
         ResourceKind::Bug { id } => {
             let url = client.url(&format!("/bugs/{id}"));
             let mut parameters = vec![("ws.op", "newMessage"), ("content", body)];
@@ -1221,10 +1519,11 @@ async fn add_comment(client: &LaunchpadClient, request: &Request) -> Result<Oper
                 parameters.push(("subject", subject));
             }
             client.post_pairs_url_ok(&url, &parameters).await?;
-            "bug"
+            ("bug", launchpad_web_url(&target.path, "bug"))
         }
-        ResourceKind::MergeProposal { repository, id } => {
-            let url = client.url(&format!("/{repository}/+merge/{id}"));
+        ResourceKind::MergeProposal { .. } | ResourceKind::MergeProposalId { .. } => {
+            let (_, proposal) = resolve_merge_proposal_target(client, request.target()?).await?;
+            let url = proposal_api_url(&proposal)?;
             let mut parameters = vec![("ws.op", "createComment"), ("content", body)];
             if let Some(subject) = request.subject.as_deref() {
                 parameters.push(("subject", subject));
@@ -1232,8 +1531,13 @@ async fn add_comment(client: &LaunchpadClient, request: &Request) -> Result<Oper
             if let Some(vote) = request.vote.as_deref() {
                 parameters.push(("vote", vote));
             }
-            client.post_pairs_url_ok(&url, &parameters).await?;
-            "branch_merge_proposal"
+            client.post_pairs_url_ok(url.as_str(), &parameters).await?;
+            (
+                "branch_merge_proposal",
+                render::text_field(&proposal, "web_link")
+                    .unwrap_or(request.target()?)
+                    .to_owned(),
+            )
         }
         ResourceKind::Repository | ResourceKind::Generic => {
             return Err(Error::invalid(
@@ -1241,7 +1545,6 @@ async fn add_comment(client: &LaunchpadClient, request: &Request) -> Result<Oper
             ));
         }
     };
-    let source_url = launchpad_web_url(&target.path, kind);
     let text = format!("Comment added to {source_url}");
     let details = json!({ "kind": kind });
     Ok(OperationResult::new(text)
@@ -1256,7 +1559,7 @@ async fn update_review_draft(
     let preview_diff_id = request.preview_diff_id()?;
     let file_line = request.file_line()?;
     let side = request.side()?;
-    let (target, proposal) = request_merge_proposal(client, request).await?;
+    let (_, proposal) = request_merge_proposal(client, request).await?;
     let preview_diff = enforce_current_preview_diff(client, &proposal, preview_diff_id).await?;
     let diff_text = get_diff_text(&preview_diff).await?;
     let location = diff::map_file_line(&diff_text, request.path("path")?, side, file_line)
@@ -1287,7 +1590,9 @@ async fn update_review_draft(
     enforce_current_preview_diff(client, &current_proposal, preview_diff_id).await?;
     save_review_drafts(client, &current_proposal, preview_diff_id, &drafts).await?;
 
-    let source_url = launchpad_web_url(&target.path, "branch_merge_proposal");
+    let source_url = render::text_field(&proposal, "web_link")
+        .unwrap_or(request.target()?)
+        .to_owned();
     let side = match location.side {
         crate::diff::DiffSide::Original => "original",
         crate::diff::DiffSide::Modified => "modified",
@@ -1310,7 +1615,7 @@ async fn update_review_draft(
 
 async fn submit_review(client: &LaunchpadClient, request: &Request) -> Result<OperationResult> {
     let preview_diff_id = request.preview_diff_id()?;
-    let (target, proposal) = request_merge_proposal(client, request).await?;
+    let (_, proposal) = request_merge_proposal(client, request).await?;
     enforce_current_preview_diff(client, &proposal, preview_diff_id).await?;
     let drafts = review_drafts(client, &proposal, preview_diff_id).await?;
     let draft_count = drafts.as_object().map_or(0, serde_json::Map::len);
@@ -1332,7 +1637,9 @@ async fn submit_review(client: &LaunchpadClient, request: &Request) -> Result<Op
     )
     .await?;
 
-    let source_url = launchpad_web_url(&target.path, "branch_merge_proposal");
+    let source_url = render::text_field(&proposal, "web_link")
+        .unwrap_or(request.target()?)
+        .to_owned();
     let text = format!(
         "Review submitted with {draft_count} inline comment{}: {source_url}",
         if draft_count == 1 { "" } else { "s" }
@@ -1352,18 +1659,15 @@ async fn set_merge_proposal_status(
     client: &LaunchpadClient,
     request: &Request,
 ) -> Result<OperationResult> {
-    let target = ResourceTarget::parse(request.target()?)?;
-    if !matches!(target.kind, ResourceKind::MergeProposal { .. }) {
-        return Err(Error::invalid(
-            "set_merge_proposal_status requires a merge proposal target",
-        ));
-    }
+    let (_, proposal) = request_merge_proposal(client, request).await?;
     let status = request.status()?;
-    let url = client.url(&format!("/{}", target.path));
+    let url = proposal_api_url(&proposal)?;
     client
-        .post_pairs_url_ok(&url, &[("ws.op", "setStatus"), ("status", status)])
+        .post_pairs_url_ok(url.as_str(), &[("ws.op", "setStatus"), ("status", status)])
         .await?;
-    let source_url = launchpad_web_url(&target.path, "branch_merge_proposal");
+    let source_url = render::text_field(&proposal, "web_link")
+        .unwrap_or(request.target()?)
+        .to_owned();
     let text = format!("Merge proposal status set to {status}: {source_url}");
     let details = json!({ "status": status });
     Ok(OperationResult::new(text)
@@ -1375,11 +1679,7 @@ async fn checkout_merge_proposal(
     client: &LaunchpadClient,
     request: &Request,
 ) -> Result<OperationResult> {
-    let target = ResourceTarget::parse(request.target()?)?;
-    let ResourceKind::MergeProposal { repository, id } = target.kind else {
-        return Err(Error::invalid("target is not a Launchpad merge proposal"));
-    };
-    let proposal = get_merge_proposal(client, &repository, id).await?;
+    let (_, proposal) = request_merge_proposal(client, request).await?;
     let spec = checkout_spec(client, &proposal).await?;
     local_git::checkout(spec, request).await
 }
@@ -1443,15 +1743,106 @@ async fn request_merge_proposal(
     client: &LaunchpadClient,
     request: &Request,
 ) -> Result<(ResourceTarget, Value)> {
-    let target = ResourceTarget::parse(request.target()?)?;
-    let (repository, id) = match &target.kind {
-        ResourceKind::MergeProposal { repository, id } => (repository.clone(), *id),
+    resolve_merge_proposal_target(client, request.target()?).await
+}
+
+async fn resolve_merge_proposal_target(
+    client: &LaunchpadClient,
+    raw_target: &str,
+) -> Result<(ResourceTarget, Value)> {
+    let target = ResourceTarget::parse(raw_target)?;
+    let proposal = match &target.kind {
+        ResourceKind::MergeProposal { repository, id } => {
+            get_merge_proposal(client, repository, *id).await?
+        }
+        ResourceKind::MergeProposalId { id } => resolve_merge_proposal_id(client, *id).await?,
         ResourceKind::Bug { .. } | ResourceKind::Repository | ResourceKind::Generic => {
-            return Err(Error::invalid("operation requires a merge proposal target"));
+            return Err(Error::invalid(
+                "operation requires a merge proposal target; accepted syntax: numeric ID or lp://~owner/project/+git/repository/+merge/ID",
+            ));
         }
     };
-    let proposal = get_merge_proposal(client, &repository, id).await?;
     Ok((target, proposal))
+}
+
+async fn resolve_merge_proposal_id(client: &LaunchpadClient, id: u64) -> Result<Value> {
+    let current = local_git::current_repository().await.map_err(|error| {
+        Error::invalid(format!(
+            "cannot resolve merge proposal ID {id} without a Launchpad checkout: {error}; accepted syntax: numeric ID in a checkout with a Launchpad remote, or lp://~owner/project/+git/repository/+merge/{id}"
+        ))
+    })?;
+    let mut repository_paths = Vec::new();
+    for remote in &current.remotes {
+        if let Ok(path) = normalise_repository(&remote.url)
+            && !repository_paths.contains(&path)
+        {
+            repository_paths.push(path);
+        }
+    }
+    let mut inspected_repositories = Vec::new();
+    for path in &repository_paths {
+        let Ok(repository) = get_repository(client, path).await else {
+            continue;
+        };
+        inspected_repositories.push(
+            render::text_field(&repository, "unique_name")
+                .unwrap_or(path)
+                .to_owned(),
+        );
+        for field in [
+            "landing_targets_collection_link",
+            "landing_candidates_collection_link",
+        ] {
+            let Some(collection_link) = render::text_field(&repository, field) else {
+                continue;
+            };
+            if let Some(proposal) = find_proposal_by_id(client, collection_link, id).await? {
+                return Ok(proposal);
+            }
+        }
+    }
+    let remotes = current
+        .remotes
+        .iter()
+        .map(|remote| format!("{}={}", remote.name, remote.url))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let repositories = if inspected_repositories.is_empty() {
+        "none".to_owned()
+    } else {
+        inspected_repositories.join(", ")
+    };
+    Err(Error::invalid(format!(
+        "cannot resolve merge proposal ID {id}; working directory: {}; inspected remotes: {}; inspected Launchpad repositories: {repositories}; accepted syntax: numeric ID in a related Launchpad checkout or lp://~owner/project/+git/repository/+merge/{id}; retry with the full merge proposal target",
+        current.working_directory.display(),
+        if remotes.is_empty() { "none" } else { &remotes }
+    )))
+}
+
+async fn find_proposal_by_id(
+    client: &LaunchpadClient,
+    first_url: &str,
+    id: u64,
+) -> Result<Option<Value>> {
+    let mut seen = HashSet::new();
+    let mut url = first_url.to_owned();
+    loop {
+        if !seen.insert(url.clone()) {
+            return Err(Error::invalid(
+                "Launchpad proposal pagination repeated a page",
+            ));
+        }
+        let page: Collection<Value> = client.get_url(&url).await?;
+        if let Some(proposal) = page.entries.into_iter().find(|proposal| {
+            render::resource_id(proposal).and_then(|value| value.parse().ok()) == Some(id)
+        }) {
+            return Ok(Some(proposal));
+        }
+        let Some(next_url) = page.next_collection_link else {
+            return Ok(None);
+        };
+        url = next_url;
+    }
 }
 
 async fn get_preview_diffs(client: &LaunchpadClient, proposal: &Value) -> Result<Vec<Value>> {
@@ -1862,29 +2253,49 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ambiguous_branch_candidates, matches_discussion_filters, normalise_inline_comment,
+        eligible_proposals, matches_discussion_filters, normalise_inline_comment, select_proposal,
         thread_state, validate_current_preview_diff,
     };
+    use crate::request::Request;
 
     #[test]
-    fn reports_ambiguous_branch_repositories() {
-        let matches = vec![
-            (
-                json!({ "unique_name": "~alice/project/+git/project" }),
-                vec![
-                    json!({ "self_link": "https://api.launchpad.net/devel/~alice/project/+git/project/+merge/10" }),
-                ],
-            ),
-            (
-                json!({ "unique_name": "~bob/project/+git/project" }),
-                vec![
-                    json!({ "self_link": "https://api.launchpad.net/devel/~bob/project/+git/project/+merge/20" }),
-                ],
-            ),
+    fn prefers_active_proposal_unless_latest_is_requested() {
+        let proposals = vec![
+            json!({
+                "self_link": "https://api.launchpad.net/devel/~owner/project/+git/repository/+merge/10",
+                "queue_status": "Needs review",
+                "date_created": "2026-01-01T00:00:00Z",
+                "target_git_path": "refs/heads/main",
+            }),
+            json!({
+                "self_link": "https://api.launchpad.net/devel/~owner/project/+git/repository/+merge/20",
+                "queue_status": "Merged",
+                "date_created": "2026-02-01T00:00:00Z",
+                "target_git_path": "refs/heads/main",
+            }),
+            json!({
+                "self_link": "https://api.launchpad.net/devel/~owner/project/+git/repository/+merge/30",
+                "queue_status": "Superseded",
+                "date_created": "2026-03-01T00:00:00Z",
+                "target_git_path": "refs/heads/main",
+            }),
         ];
-        let candidates = ambiguous_branch_candidates(&matches, "refs/heads/fix").unwrap();
-        assert!(candidates.contains("~alice/project/+git/project:refs/heads/fix (MP 10)"));
-        assert!(candidates.contains("~bob/project/+git/project:refs/heads/fix (MP 20)"));
+        let preferred: Request = serde_json::from_str(
+            r#"{"op":"merge_proposal_for_branch","repository":"project","branch":"feature"}"#,
+        )
+        .unwrap();
+        let eligible = eligible_proposals(proposals.clone(), &preferred);
+        assert_eq!(eligible.len(), 2);
+        let (selected, _, _) = select_proposal(eligible, &preferred).unwrap();
+        assert_eq!(selected["queue_status"], "Needs review");
+
+        let latest: Request = serde_json::from_str(
+            r#"{"op":"merge_proposal_for_branch","repository":"project","branch":"feature","latest":true}"#,
+        )
+        .unwrap();
+        let eligible = eligible_proposals(proposals, &latest);
+        let (selected, _, _) = select_proposal(eligible, &latest).unwrap();
+        assert_eq!(selected["queue_status"], "Merged");
     }
 
     #[test]

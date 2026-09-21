@@ -178,7 +178,7 @@ Expected heading:
 # Merge proposal lookup for ~launchpad-committers/launchpad-ui/+git/launchpad-ui:refs/heads/manage-views-panel
 ```
 
-Test complete merge-proposal discussion aggregation:
+Test the default compact merge-proposal review summary:
 
 ```sh
 omp -p --no-session --auto-approve --no-extensions -e ./index.ts \
@@ -188,8 +188,11 @@ omp -p --no-session --auto-approve --no-extensions -e ./index.ts \
 Expected heading:
 
 ```text
-# Merge proposal 511601 discussion
+# Merge proposal 511601 review summary
 ```
+
+Set `format` to `structured` to return JSON only, or `both` to return the
+compact summary followed by the full JSON discussion.
 
 Test repository file transport:
 
@@ -259,7 +262,7 @@ To return to the published plugin after local testing, install the pinned npm
 package:
 
 ```sh
-omp plugin install omp-launchpad@0.4.0
+omp plugin install omp-launchpad@0.5.0
 ```
 
 ## Bridge-only diagnosis

@@ -86,7 +86,7 @@ Bug and merge-proposal views include comments by default. Add `?comments=0` to o
 
 The dedicated tools expose these operations:
 
-- `launchpad`: `resource_view`, `repo_view`, `file_read`, `search_bugs`, `search_merge_proposals`, `merge_proposal_for_branch`, `merge_proposal_discussion`, `preview_diffs`, `inline_comments`, `review_drafts`, `diff_line_map`
+- `launchpad`: `resource_view`, `repo_view`, `file_read`, `search_bugs`, `search_merge_proposals`, `merge_proposal_for_branch`, `current_merge_proposal`, `merge_proposal_discussion`, `preview_diffs`, `inline_comments`, `review_drafts`, `diff_line_map`
 - `launchpad_write`: `bug_create`, `merge_proposal_create`, `comment`, `review_draft_update`, `review_submit`, `set_merge_proposal_status`, `merge_proposal_checkout`, `merge_proposal_push`
 
 Example prompts:
@@ -96,9 +96,13 @@ Use launchpad to search bugs for target ubuntu with query installer and limit 5.
 
 Find the merge proposal for branch `fix-login` in repository `my-project`.
 
-Show the complete merge-proposal discussion for lp://~owner/project/+git/repository/+merge/123.
+Resolve the preferred merge proposal for the current Git checkout.
 
-Show the complete merge-proposal discussion for the current Git checkout.
+Show the compact review summary for merge proposal 123 from a related Launchpad checkout.
+
+Show the structured merge-proposal discussion for lp://~owner/project/+git/repository/+merge/123.
+
+Show the merge-proposal discussion for the current Git checkout with format both.
 
 Show unresolved inline comments on the current diff for lp://~owner/project/+git/repository/+merge/123.
 
@@ -114,29 +118,44 @@ Check out lp://~owner/project/+git/repository/+merge/123 into /tmp/proposal-123.
 ```
 
 Repository parameters accept short names, canonical paths, `lp://` identifiers,
-Launchpad web URLs, HTTPS clone URLs, SSH URLs, and `git@` clone URLs. If an
-explicit repository does not contain the requested branch proposal,
-`merge_proposal_for_branch` and branch-based `merge_proposal_discussion`
-search same-named and default repositories for the same Launchpad target. They
-identify the repository they resolved and fail with all candidates when the
-branch is ambiguous across repositories.
+Launchpad web URLs, HTTPS clone URLs, SSH URLs, and `git@` clone URLs. Merge
+proposal targets also accept a numeric ID such as `511601` when the working
+checkout has a related Launchpad remote; use the full Launchpad URL or path
+when no repository context is available.
 
-`merge_proposal_for_branch` and `merge_proposal_discussion` infer the repository
-from the current checkout's `origin` remote and use its current branch when both
-parameters are omitted.
+`current_merge_proposal` inspects the working directory, current branch, and
+all Git remotes. It prefers a Launchpad `origin`, otherwise the first Launchpad
+remote. `merge_proposal_for_branch` and branch-based
+`merge_proposal_discussion` use the same inference when repository and branch
+are omitted.
 
-Discussion results contain readable Markdown followed by a `Structured data`
-JSON block. The same JSON is available in the tool result details. Stable fields
-include the proposal ID and URL, current preview-diff ID, review votes, written
-general comments, normalized author usernames and display names, and flattened
-inline threads with file, source/target line, diff line, replies, and state.
-By default, discussions include inline threads from every preview diff.
+Branch lookup first checks the requested source repository, then same-named and
+default repositories for the same Launchpad target. It applies `status` and
+`target_branch`, excludes superseded proposals unless `include_superseded` is
+true or the status filter explicitly requests them, and prefers an active
+proposal over a merged proposal. Within that status class it selects the newest
+creation date and ID. `latest: true` instead selects the newest matching
+proposal regardless of status class. Results expose `selected_proposal`,
+`selection_reason`, filters, candidates, and alternatives. Ambiguous and empty
+results report inspected repositories and actionable retry parameters.
+
+Discussion `format` accepts `summary`, `structured`, or `both`; `summary` is
+the default. The compact summary reports general-comment and review counts,
+current/open, outdated, and superseded inline-thread counts, current review
+votes, and vote transitions. Launchpad does not expose formal inline-thread
+resolution, so resolved count is reported as unavailable. `structured`
+returns the complete JSON discussion without Markdown duplication; `both`
+returns the compact summary followed by that JSON. The same JSON is always
+available in the tool result details, including normalized identities, full
+general comments, review activity, and flattened inline threads with file,
+source/target line, diff line, replies, and state.
+
+By default, discussions inspect inline threads from every preview diff.
 `current_diff_only` narrows that history; `comments` accepts `all`, `general`,
 or `inline`; `since` accepts an RFC 3339 timestamp; and `reviewer` matches a
 Launchpad username or display name. `unresolved_only` returns current, open
-threads. Launchpad does not expose formal thread resolution, so current
-non-stale threads are `open`, stale threads are `outdated`, and non-current
-non-stale threads are `superseded`; no inferred `resolved` state is reported.
+threads. Stale threads are `outdated`, and non-current non-stale threads are
+`superseded`.
 
 Searches paginate up to the requested limit. Limits above 1,000 are rejected
 explicitly rather than silently truncated.

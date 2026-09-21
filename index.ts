@@ -113,6 +113,13 @@ export default function launchpadExtension(pi: ExtensionAPI) {
   const positiveInteger = z.number().int().positive()
   const limitInteger = positiveInteger.max(1000)
   const diffSide = z.enum(["original", "modified"])
+  const mergeProposalTarget = z.union([z.string(), positiveInteger])
+  const proposalSelection = {
+    status: oneOrManyStrings.optional(),
+    target_branch: z.string().optional(),
+    latest: z.boolean().optional(),
+    include_superseded: z.boolean().optional(),
+  }
   const reviewVote = z.enum([
     "Approve",
     "Needs Fixing",
@@ -126,15 +133,15 @@ export default function launchpadExtension(pi: ExtensionAPI) {
     name: "launchpad",
     label: "Launchpad",
     description:
-      "Read Launchpad through lpcli. Repository inputs accept Launchpad paths and Git remote URLs. Branch lookup " +
-      "searches repositories for the same target when needed and reports ambiguous matches. Discussion results " +
-      "include structured general comments, review votes, identities, and inline threads from every preview diff; " +
-      "filters can select current/open inline threads, comment kinds, time, or reviewer. Prefer read with lp:// " +
-      "URLs for individual bugs, merge proposals, and diff text.",
+      "Read Launchpad through lpcli. Repository inputs accept Launchpad paths and Git remote URLs. Branch and current " +
+      "checkout lookup use explicit proposal selection rules and report the selected proposal and reason. Discussion " +
+      "defaults to a compact review summary; format can request structured data or both. Merge proposal targets accept " +
+      "a full Launchpad URL/path or a numeric ID when the working checkout has a related Launchpad remote. Prefer read " +
+      "with lp:// URLs for individual bugs, merge proposals, and diff text.",
     parameters: z.union([
       z.object({
         op: z.literal("resource_view"),
-        target: z.string(),
+        target: mergeProposalTarget,
         preview_diff_id: positiveInteger.optional(),
         ...withIntent,
       }),
@@ -159,6 +166,7 @@ export default function launchpadExtension(pi: ExtensionAPI) {
       z.object({
         op: z.literal("search_merge_proposals"),
         repository: z.string(),
+        status: oneOrManyStrings.optional(),
         limit: limitInteger.optional(),
         ...withIntent,
       }),
@@ -166,36 +174,44 @@ export default function launchpadExtension(pi: ExtensionAPI) {
         op: z.literal("merge_proposal_for_branch"),
         repository: z.string().optional(),
         branch: z.string().optional(),
+        ...proposalSelection,
+        ...withIntent,
+      }),
+      z.object({
+        op: z.literal("current_merge_proposal"),
+        ...proposalSelection,
         ...withIntent,
       }),
       z.object({
         op: z.literal("merge_proposal_discussion"),
-        target: z.string().optional(),
+        target: mergeProposalTarget.optional(),
         repository: z.string().optional(),
         branch: z.string().optional(),
+        format: z.enum(["summary", "structured", "both"]).optional(),
         current_diff_only: z.boolean().optional(),
         unresolved_only: z.boolean().optional(),
         comments: z.enum(["all", "general", "inline"]).optional(),
         since: z.string().optional(),
         reviewer: z.string().optional(),
+        ...proposalSelection,
         ...withIntent,
       }),
-      z.object({ op: z.literal("preview_diffs"), target: z.string(), ...withIntent }),
+      z.object({ op: z.literal("preview_diffs"), target: mergeProposalTarget, ...withIntent }),
       z.object({
         op: z.literal("inline_comments"),
-        target: z.string(),
+        target: mergeProposalTarget,
         preview_diff_id: positiveInteger,
         ...withIntent,
       }),
       z.object({
         op: z.literal("review_drafts"),
-        target: z.string(),
+        target: mergeProposalTarget,
         preview_diff_id: positiveInteger,
         ...withIntent,
       }),
       z.object({
         op: z.literal("diff_line_map"),
-        target: z.string(),
+        target: mergeProposalTarget,
         preview_diff_id: positiveInteger,
         path: z.string(),
         file_line: positiveInteger,
@@ -205,7 +221,7 @@ export default function launchpadExtension(pi: ExtensionAPI) {
     ]),
     approval: "read",
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const request = params as BridgeRequest
+      const request = normalizeBridgeRequest(params as BridgeRequest)
       return bridgeResult(await runBridge(request, signal, ctx.cwd))
     },
   })
@@ -239,7 +255,7 @@ export default function launchpadExtension(pi: ExtensionAPI) {
       }),
       z.object({
         op: z.literal("comment"),
-        target: z.string(),
+        target: mergeProposalTarget,
         body: z.string(),
         subject: z.string().optional(),
         vote: reviewVote.optional(),
@@ -247,7 +263,7 @@ export default function launchpadExtension(pi: ExtensionAPI) {
       }),
       z.object({
         op: z.literal("review_draft_update"),
-        target: z.string(),
+        target: mergeProposalTarget,
         preview_diff_id: positiveInteger,
         path: z.string(),
         file_line: positiveInteger,
@@ -257,7 +273,7 @@ export default function launchpadExtension(pi: ExtensionAPI) {
       }),
       z.object({
         op: z.literal("review_submit"),
-        target: z.string(),
+        target: mergeProposalTarget,
         preview_diff_id: positiveInteger,
         body: z.string().optional(),
         vote: reviewVote.optional(),
@@ -265,13 +281,13 @@ export default function launchpadExtension(pi: ExtensionAPI) {
       }),
       z.object({
         op: z.literal("set_merge_proposal_status"),
-        target: z.string(),
+        target: mergeProposalTarget,
         status: z.string(),
         ...withIntent,
       }),
       z.object({
         op: z.literal("merge_proposal_checkout"),
-        target: z.string(),
+        target: mergeProposalTarget,
         directory: z.string().optional(),
         ...withIntent,
       }),
@@ -284,7 +300,7 @@ export default function launchpadExtension(pi: ExtensionAPI) {
     ]),
     approval: "exec",
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const request = params as BridgeRequest
+      const request = normalizeBridgeRequest(params as BridgeRequest)
       return bridgeResult(await runBridge(request, signal, ctx.cwd), true)
     },
   })
@@ -392,6 +408,12 @@ async function runCommand(command: "logout" | "status", cwd: string): Promise<st
 
 function isLaunchpadUrl(path: unknown): path is string {
   return typeof path === "string" && path.startsWith("lp://")
+}
+
+function normalizeBridgeRequest(request: BridgeRequest): BridgeRequest {
+  return typeof request.target === "number"
+    ? { ...request, target: String(request.target) }
+    : request
 }
 
 async function runBridge(

@@ -22,6 +22,20 @@ pub struct CheckoutSpec {
     pub web_link: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct GitRemote {
+    pub name: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct CurrentRepository {
+    pub working_directory: PathBuf,
+    pub branch: String,
+    pub remotes: Vec<GitRemote>,
+    pub selected_remote: GitRemote,
+}
+
 pub async fn checkout(spec: CheckoutSpec, request: &Request) -> Result<OperationResult> {
     let branch = spec
         .source_ref
@@ -105,20 +119,67 @@ pub async fn checkout(spec: CheckoutSpec, request: &Request) -> Result<Operation
         .with_details(details))
 }
 
-pub async fn current_repository_branch() -> Result<(String, String)> {
-    let branch = git_stdout(["rev-parse", "--abbrev-ref", "HEAD"]).await?;
+pub async fn current_repository() -> Result<CurrentRepository> {
+    let working_directory = std::env::current_dir().map_err(|source| Error::Io {
+        path: PathBuf::from("."),
+        source,
+    })?;
+    let branch = git_stdout(["rev-parse", "--abbrev-ref", "HEAD"])
+        .await
+        .map_err(|error| {
+            Error::invalid(format!(
+                "cannot inspect the current Git branch in {}: {error}; retry from a Git checkout or provide repository and branch",
+                working_directory.display()
+            ))
+        })?;
     if branch.is_empty() || branch == "HEAD" {
-        return Err(Error::invalid(
-            "cannot infer a merge proposal from a detached HEAD; provide repository and branch",
-        ));
+        return Err(Error::invalid(format!(
+            "cannot infer a merge proposal from detached HEAD in {}; retry with repository and branch or a full Launchpad merge proposal target",
+            working_directory.display()
+        )));
     }
-    let repository = git_stdout(["remote", "get-url", "origin"]).await?;
-    if repository.is_empty() {
-        return Err(Error::invalid(
-            "cannot infer a Launchpad repository because origin has no URL",
-        ));
+    let remote_names = git_stdout(["remote"]).await.map_err(|error| {
+        Error::invalid(format!(
+            "cannot inspect Git remotes in {}: {error}; retry from a Git checkout or provide repository and branch",
+            working_directory.display()
+        ))
+    })?;
+    let mut remotes = Vec::new();
+    for name in remote_names.lines().filter(|name| !name.trim().is_empty()) {
+        let url = git_stdout(["remote", "get-url", name]).await?;
+        remotes.push(GitRemote {
+            name: name.to_owned(),
+            url,
+        });
     }
-    Ok((repository, branch))
+    let selected_remote = remotes
+        .iter()
+        .filter(|remote| remote.url.contains("launchpad.net") || remote.url.starts_with("lp:"))
+        .min_by_key(|remote| if remote.name == "origin" { 0 } else { 1 })
+        .cloned()
+        .ok_or_else(|| {
+            let inspected = remotes
+                .iter()
+                .map(|remote| format!("{}={}", remote.name, remote.url))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Error::invalid(format!(
+                "cannot infer a Launchpad repository in {}; inspected remotes: {}; accepted syntax: lp:<project>, lp://~owner/project/+git/repository, or a git.launchpad.net URL; retry with repository and branch or a full merge proposal target",
+                working_directory.display(),
+                if inspected.is_empty() { "none" } else { &inspected }
+            ))
+        })?;
+    Ok(CurrentRepository {
+        working_directory,
+        branch,
+        remotes,
+        selected_remote,
+    })
+}
+
+pub async fn current_repository_branch() -> Result<(String, String)> {
+    let current = current_repository().await?;
+    Ok((current.selected_remote.url, current.branch))
 }
 
 pub async fn push(request: &Request) -> Result<OperationResult> {
