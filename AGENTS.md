@@ -1,6 +1,6 @@
 # Agent Instructions
 
-Follow @CODING_STANDARD.md for coding standards and @DEVELOPMENT.md for development and verification workflows.
+Follow @docs/code-standards/site/src/SUMMARY.md for coding standards and @DEVELOPMENT.md for development and verification workflows.
 
 ## Git
 
