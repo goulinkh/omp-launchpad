@@ -1,0 +1,23 @@
+[package]
+name = "omp-launchpad"
+version = "0.1.0"
+edition = "2024"
+description = "Launchpad resources and operations for Oh My Pi"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/goulinkh/omp-launchpad"
+rust-version = "1.88"
+
+[[bin]]
+name = "omp-launchpad"
+path = "src/main.rs"
+
+[dependencies]
+dirs = "6"
+lpcli = { git = "https://github.com/canonical/lpcli", rev = "0a8cdf0e212f05b6cebbad3af1389a1c81f8a25d" }
+percent-encoding = "2"
+reqwest = { version = "0.13", default-features = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+url = "2"
