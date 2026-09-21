@@ -1,3 +1,3 @@
 # Coding Standards
 
-Follow the [Microsoft Pragmatic Rust Guidelines](https://github.com/microsoft/rust-guidelines/tree/main).
+Follow the [Canonical Rust Best Practices](vendor/rust-best-practices/site/src/SUMMARY.md).
