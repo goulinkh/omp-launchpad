@@ -3,48 +3,103 @@
 ## Prerequisites
 
 - Bun
+- Rust 1.88 or newer
 - OMP 18.1.19 or newer
-- `lp-shell` on `PATH`
-- A cached Launchpad login for authenticated and private-resource tests
+- An `lpcli` login for authenticated and private-resource operations
 
-Confirm the external dependency before testing the extension:
+The pinned toolchain in `rust-toolchain.toml` installs automatically through
+`rustup`. Install and authenticate `lpcli` when write access is required:
 
 ```sh
-lp-shell --help
-lp-shell -c 'print(lp.me.name)' production devel
+cargo install --git https://github.com/canonical/lpcli --locked lpcli
+lpcli login
+lpcli status
 ```
 
-Use `-a` with `lp-shell` when testing only public resources anonymously.
+Public resources can be tested without credentials by setting:
+
+```sh
+export OMP_LAUNCHPAD_ANONYMOUS=1
+```
+
+## Native release artifacts
+
+Pushing a tag matching the package version, such as `v0.1.0`, runs
+`.github/workflows/release.yml`. The workflow verifies the source, builds with
+`Cargo.lock`, and produces native packages for:
+
+- Linux x64 and arm64
+- macOS x64 and arm64
+- Windows x64 and arm64
+
+Each matrix job emits a standalone binary and an installable npm tarball named
+`omp-launchpad-<version>-<platform>-<architecture>`. Tagged runs attach every
+asset plus `SHA256SUMS` to the corresponding GitHub release. Manual workflow
+runs build downloadable Actions artifacts without creating a release.
+
+The tarball stores its executable at
+`bin/omp-launchpad-<platform>-<architecture>[.exe]`. The TypeScript extension
+selects the command in this order:
+
+1. `OMP_LAUNCHPAD_BINARY`
+2. The packaged binary matching `process.platform` and `process.arch`
+3. `cargo run --release` from a source checkout
+
+Create one platform package locally after building its explicit Rust target:
+
+```sh
+cargo build --locked --release --target aarch64-apple-darwin
+node scripts/package-release.mjs aarch64-apple-darwin darwin arm64
+```
 
 ## Static checks
 
-Run the JavaScript syntax check and compile the Python bridge without writing bytecode:
+Run the TypeScript type check, Rust formatter check, and Clippy:
 
 ```sh
 bun run check
 ```
 
-## Load the working tree directly
-
-During development, load `index.js` explicitly so OMP executes the current working tree without installing or copying it:
+Run the Rust unit tests separately:
 
 ```sh
-cd /path/to/omp-launchpad
-omp --no-extensions -e ./index.js
+cargo test
 ```
 
-`--no-extensions` isolates this extension from other installed extensions. It is useful for diagnosing registration, schema, and execution failures. Remove it for the final compatibility check.
+## Load the working tree directly
 
-Start a new OMP process after changing extension code. An existing process retains the module version it loaded at startup unless it is explicitly reloaded.
+During development, load `index.ts` explicitly so OMP executes the current
+working tree without installing or copying it:
 
-Do not use `omp read lp://...` as the extension smoke test. The standalone `omp read` command exercises OMP's native internal-URL router directly; it does not execute the extension's `read` wrapper. Test through an actual agent session instead.
+```sh
+omp --no-extensions -e ./index.ts
+```
+
+`--no-extensions` isolates this extension from other installed extensions.
+Start a new OMP process after changing extension code because an existing
+process retains the module version it loaded at startup.
+
+The TypeScript extension prefers a matching binary in `bin/`. A working-tree
+checkout does not contain generated binaries by default, so it invokes
+`cargo run --release` and rebuilds source changes incrementally. To bypass
+Cargo after an explicit release build, point the extension at the binary:
+
+```sh
+cargo build --release
+export OMP_LAUNCHPAD_BINARY="$PWD/target/release/omp-launchpad"
+```
+
+Do not use `omp read lp://...` as the extension smoke test. The standalone
+`omp read` command exercises OMP's native internal-URL router directly; it
+does not execute the extension's `read` wrapper. Test through an actual agent
+session instead.
 
 ## Read-path smoke tests
 
 Test a Launchpad bug through the wrapped `read` tool:
 
 ```sh
-omp -p --no-session --auto-approve --no-extensions -e ./index.js \
+omp -p --no-session --auto-approve --no-extensions -e ./index.ts \
   'Use read exactly once on lp://bugs/1?comments=0, then print only the first heading returned.'
 ```
 
@@ -57,7 +112,7 @@ Expected heading:
 Test a merge-proposal diff:
 
 ```sh
-omp -p --no-session --auto-approve --no-extensions -e ./index.js \
+omp -p --no-session --auto-approve --no-extensions -e ./index.ts \
   'Use read exactly once on lp://~finnrg/launchpad/+git/launchpad/+merge/511704/diff, then print only the first line returned.'
 ```
 
@@ -67,10 +122,11 @@ Expected prefix:
 diff --git
 ```
 
-Verify that non-Launchpad paths still delegate to OMP's native `read` implementation:
+Verify that non-Launchpad paths still delegate to OMP's native `read`
+implementation:
 
 ```sh
-omp -p --no-session --auto-approve --no-extensions -e ./index.js \
+omp -p --no-session --auto-approve --no-extensions -e ./index.ts \
   'Use read exactly once on package.json, then print only the package name.'
 ```
 
@@ -85,7 +141,7 @@ omp-launchpad
 Test the read-only `launchpad` tool:
 
 ```sh
-omp -p --no-session --auto-approve --no-extensions -e ./index.js \
+omp -p --no-session --auto-approve --no-extensions -e ./index.ts \
   'Use launchpad exactly once with op search_merge_proposals, repository launchpad, status ["Needs review"], and limit 1. Then print only the result heading.'
 ```
 
@@ -98,17 +154,18 @@ Expected heading:
 Test repository file transport:
 
 ```sh
-omp -p --no-session --auto-approve --no-extensions -e ./index.js \
+omp -p --no-session --auto-approve --no-extensions -e ./index.ts \
   'Use launchpad exactly once with op file_read, repository launchpad, path README, and branch master. Then print only the first line returned.'
 ```
 
 ## Checkout smoke test
 
-`merge_proposal_checkout` changes only local Git state, so it is the safest `launchpad_write` operation to exercise end to end:
+`merge_proposal_checkout` changes only local Git state, so it is the safest
+`launchpad_write` operation to exercise end to end:
 
 ```sh
 tmp="$(mktemp -d)"
-omp -p --no-session --auto-approve --no-extensions -e ./index.js \
+omp -p --no-session --auto-approve --no-extensions -e ./index.ts \
   "Use launchpad_write exactly once with op merge_proposal_checkout, target lp://~enriqueesanchz/lazr.restfulclient/+git/lazr.restfulclient/+merge/500054, and directory $tmp/checkout. Then print only the first heading returned."
 rm -rf "$tmp"
 ```
@@ -119,11 +176,17 @@ Expected heading:
 # Checked out Launchpad merge proposal 500054
 ```
 
-Never smoke-test `bug_create`, `merge_proposal_create`, `comment`, `set_merge_proposal_status`, or `merge_proposal_push` against production merely to prove wiring. Use an expendable resource or a non-production Launchpad instance:
+Never smoke-test `bug_create`, `merge_proposal_create`, `comment`,
+`set_merge_proposal_status`, or `merge_proposal_push` against production
+merely to prove wiring. Use an expendable resource or a non-production
+Launchpad instance:
 
 ```sh
-OMP_LAUNCHPAD_INSTANCE=staging omp --no-extensions -e ./index.js
+OMP_LAUNCHPAD_INSTANCE=staging omp --no-extensions -e ./index.ts
 ```
+
+`OMP_LAUNCHPAD_API_BASE` overrides the complete API base URL for a local test
+server.
 
 ## Test the installed-plugin path
 
@@ -134,14 +197,17 @@ omp plugin link "$PWD"
 omp plugin list --json
 ```
 
-The list must show `omp-launchpad`, version `0.1.0`, with its path resolving to this checkout. Start a fresh OMP process and repeat the read-path smoke tests without `--no-extensions -e ./index.js`:
+The list must show `omp-launchpad`, version `0.1.0`, with its path resolving to
+this checkout. Start a fresh OMP process and repeat the read-path smoke tests
+without `--no-extensions -e ./index.ts`:
 
 ```sh
 omp -p --no-session --auto-approve \
   'Use read exactly once on lp://bugs/1?comments=0, then print only the first heading returned.'
 ```
 
-This final pass catches interactions with other installed extensions. When `omp-semantic-policy` evaluates all custom tools, classify the tools as:
+This final pass catches interactions with other installed extensions. When
+`omp-semantic-policy` evaluates all custom tools, classify the tools as:
 
 ```text
 launchpad=read,launchpad_write=execute
@@ -149,7 +215,8 @@ launchpad=read,launchpad_write=execute
 
 The `read` wrapper itself retains OMP's native `read` classification.
 
-To return to the published plugin after local testing, rerun the dotfiles plugin installer or install the GitHub source directly:
+To return to the published plugin after local testing, rerun the dotfiles
+plugin installer or install the GitHub source directly:
 
 ```sh
 omp plugin install github:goulinkh/omp-launchpad
@@ -157,18 +224,19 @@ omp plugin install github:goulinkh/omp-launchpad
 
 ## Bridge-only diagnosis
 
-When extension registration succeeds but Launchpad access fails, execute the Python bridge inside `lp-shell` directly:
+Execute the Rust bridge directly when extension registration succeeds but
+Launchpad access fails:
 
 ```sh
-export OMP_LAUNCHPAD_BRIDGE="$PWD/bridge.py"
-export OMP_LAUNCHPAD_REQUEST='{"op":"resource_view","target":"lp://bugs/1?comments=0"}'
-lp-shell -c 'import os; globals()["lp"] = lp; exec(compile(open(os.environ["OMP_LAUNCHPAD_BRIDGE"], encoding="utf-8").read(), os.environ["OMP_LAUNCHPAD_BRIDGE"], "exec"), globals())' production devel
+printf '%s' '{"op":"resource_view","target":"lp://bugs/1?comments=0"}' |
+  cargo run --quiet --release --
 ```
 
 A successful response starts with:
 
 ```text
-__OMP_LAUNCHPAD__{"ok": true
+{"ok":true,"text":"# Bug #1:
 ```
 
-This separates `lp-shell` authentication and Launchpad API failures from OMP extension-loading failures.
+This separates Rust, `lpcli` authentication, and Launchpad API failures from
+OMP extension-loading failures.
