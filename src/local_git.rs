@@ -105,6 +105,22 @@ pub async fn checkout(spec: CheckoutSpec, request: &Request) -> Result<Operation
         .with_details(details))
 }
 
+pub async fn current_repository_branch() -> Result<(String, String)> {
+    let branch = git_stdout(["rev-parse", "--abbrev-ref", "HEAD"]).await?;
+    if branch.is_empty() || branch == "HEAD" {
+        return Err(Error::invalid(
+            "cannot infer a merge proposal from a detached HEAD; provide repository and branch",
+        ));
+    }
+    let repository = git_stdout(["remote", "get-url", "origin"]).await?;
+    if repository.is_empty() {
+        return Err(Error::invalid(
+            "cannot infer a Launchpad repository because origin has no URL",
+        ));
+    }
+    Ok((repository, branch))
+}
+
 pub async fn push(request: &Request) -> Result<OperationResult> {
     let directory = request.directory.as_deref().map(PathBuf::from).unwrap_or(
         std::env::current_dir().map_err(|source| Error::Io {
@@ -225,6 +241,15 @@ async fn run_git<'argument>(
         });
     }
     Ok(output)
+}
+
+async fn git_stdout<'argument>(
+    arguments: impl IntoIterator<Item = &'argument str>,
+) -> Result<String> {
+    let output = run_git(arguments).await?;
+    String::from_utf8(output.stdout)
+        .map_err(|source| Error::OutputEncoding { source })
+        .map(|stdout| stdout.trim().to_owned())
 }
 
 fn path_text(path: &Path) -> Result<&str> {

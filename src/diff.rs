@@ -63,6 +63,42 @@ pub fn map_file_line(
     None
 }
 
+pub fn locate_diff_line(diff: &str, diff_line: usize) -> Option<DiffLocation> {
+    let target = diff_line.checked_sub(1)?;
+    let lines: Vec<_> = diff.lines().collect();
+    let file_start = (0..=target).rev().find(|index| {
+        lines
+            .get(*index)
+            .is_some_and(|line| line.starts_with("diff --git "))
+    })?;
+    let file_end = lines[file_start + 1..]
+        .iter()
+        .position(|line| line.starts_with("diff --git "))
+        .map(|offset| file_start + offset + 1)
+        .unwrap_or(lines.len());
+    find_in_file_segment(
+        &lines,
+        file_start + 1,
+        file_end,
+        |_, _| true,
+        |current_diff_line, kind, original_line, modified_line| {
+            if current_diff_line != diff_line {
+                return None;
+            }
+            let side = if kind == DiffLineKind::Removed {
+                DiffSide::Original
+            } else {
+                DiffSide::Modified
+            };
+            let file_line = match side {
+                DiffSide::Original => original_line?,
+                DiffSide::Modified => modified_line?,
+            };
+            Some((side, file_line))
+        },
+    )
+}
+
 fn map_file_segment(
     lines: &[&str],
     start: usize,
@@ -70,6 +106,37 @@ fn map_file_segment(
     requested_path: &str,
     side: DiffSide,
     file_line: u64,
+) -> Option<DiffLocation> {
+    find_in_file_segment(
+        lines,
+        start,
+        end,
+        |original_path, modified_path| {
+            (requested_path == original_path || requested_path == modified_path)
+                && !(side == DiffSide::Original && original_path == "/dev/null")
+                && !(side == DiffSide::Modified && modified_path == "/dev/null")
+        },
+        |_, _, original_line, modified_line| {
+            let current_line = match side {
+                DiffSide::Original => original_line,
+                DiffSide::Modified => modified_line,
+            };
+            (current_line == Some(file_line)).then_some((side, file_line))
+        },
+    )
+}
+
+fn find_in_file_segment(
+    lines: &[&str],
+    start: usize,
+    end: usize,
+    accept_paths: impl FnOnce(&str, &str) -> bool,
+    mut select_line: impl FnMut(
+        usize,
+        DiffLineKind,
+        Option<u64>,
+        Option<u64>,
+    ) -> Option<(DiffSide, u64)>,
 ) -> Option<DiffLocation> {
     let header = (start..end).find(|index| {
         lines[*index].starts_with("--- ")
@@ -79,19 +146,13 @@ fn map_file_segment(
     })?;
     let original_path = normalise_path(&lines[header][4..])?;
     let modified_path = normalise_path(&lines[header + 1][4..])?;
-    if requested_path != original_path && requested_path != modified_path {
+    if !accept_paths(&original_path, &modified_path) {
         return None;
     }
-    if (side == DiffSide::Original && original_path == "/dev/null")
-        || (side == DiffSide::Modified && modified_path == "/dev/null")
-    {
-        return None;
-    }
-
     let display_path = if modified_path == "/dev/null" {
-        original_path.as_str()
+        original_path
     } else {
-        modified_path.as_str()
+        modified_path
     };
     let mut index = header + 2;
     while index < end {
@@ -102,32 +163,33 @@ fn map_file_segment(
         index += 1;
         while index < end && !lines[index].starts_with("@@ ") {
             let line = lines[index];
-            let (kind, current_line) = if line.starts_with('+') {
-                let current_line = (side == DiffSide::Modified).then_some(modified_line);
+            let (kind, current_original, current_modified) = if line.starts_with('+') {
+                let current_modified = Some(modified_line);
                 modified_line = modified_line.checked_add(1)?;
-                (DiffLineKind::Added, current_line)
+                (DiffLineKind::Added, None, current_modified)
             } else if line.starts_with('-') {
-                let current_line = (side == DiffSide::Original).then_some(original_line);
+                let current_original = Some(original_line);
                 original_line = original_line.checked_add(1)?;
-                (DiffLineKind::Removed, current_line)
+                (DiffLineKind::Removed, current_original, None)
             } else if line.starts_with(' ') {
-                let current_line = Some(match side {
-                    DiffSide::Original => original_line,
-                    DiffSide::Modified => modified_line,
-                });
+                let current_original = Some(original_line);
+                let current_modified = Some(modified_line);
                 original_line = original_line.checked_add(1)?;
                 modified_line = modified_line.checked_add(1)?;
-                (DiffLineKind::Context, current_line)
+                (DiffLineKind::Context, current_original, current_modified)
             } else {
                 index += 1;
                 continue;
             };
-            if current_line == Some(file_line) {
+            let diff_line = index + 1;
+            if let Some((side, file_line)) =
+                select_line(diff_line, kind, current_original, current_modified)
+            {
                 return Some(DiffLocation {
-                    path: display_path.to_owned(),
+                    path: display_path,
                     side,
                     file_line,
-                    diff_line: index + 1,
+                    diff_line,
                     kind,
                 });
             }
@@ -208,7 +270,7 @@ fn parse_range_start(range: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiffLineKind, DiffSide, map_file_line};
+    use super::{DiffLineKind, DiffSide, locate_diff_line, map_file_line};
 
     const DIFF: &str = concat!(
         "diff --git a/src/old.rs b/src/new.rs\n",
@@ -229,6 +291,20 @@ mod tests {
         "diff --git \"a/\\303\\251.rs\" \"b/\\303\\251.rs\"\n",
         "--- \"a/\\303\\251.rs\"\n",
         "+++ \"b/\\303\\251.rs\"\n",
+        "@@ -1 +1 @@\n",
+        "-old\n",
+        "+new\n",
+    );
+
+    const MULTI_FILE_DIFF: &str = concat!(
+        "diff --git a/first.rs b/first.rs\n",
+        "--- a/first.rs\n",
+        "+++ b/first.rs\n",
+        "@@ -0,0 +1 @@\n",
+        "+first\n",
+        "diff --git a/second.rs b/second.rs\n",
+        "--- a/second.rs\n",
+        "+++ b/second.rs\n",
         "@@ -1 +1 @@\n",
         "-old\n",
         "+new\n",
@@ -267,6 +343,28 @@ mod tests {
     fn decodes_quoted_git_paths() {
         let location = map_file_line(QUOTED_PATH_DIFF, "é.rs", DiffSide::Modified, 1).unwrap();
         assert_eq!(location.diff_line, 6);
+        assert_eq!(location.kind, DiffLineKind::Added);
+    }
+
+    #[test]
+    fn locates_global_diff_lines() {
+        let added = locate_diff_line(DIFF, 10).unwrap();
+        assert_eq!(added.path, "src/new.rs");
+        assert_eq!(added.side, DiffSide::Modified);
+        assert_eq!(added.file_line, 11);
+        assert_eq!(added.kind, DiffLineKind::Added);
+
+        let removed = locate_diff_line(DIFF, 9).unwrap();
+        assert_eq!(removed.side, DiffSide::Original);
+        assert_eq!(removed.file_line, 11);
+        assert_eq!(removed.kind, DiffLineKind::Removed);
+    }
+
+    #[test]
+    fn locates_lines_in_later_files() {
+        let location = locate_diff_line(MULTI_FILE_DIFF, 11).unwrap();
+        assert_eq!(location.path, "second.rs");
+        assert_eq!(location.file_line, 1);
         assert_eq!(location.kind, DiffLineKind::Added);
     }
 

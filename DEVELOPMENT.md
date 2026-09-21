@@ -162,7 +162,33 @@ omp -p --no-session --auto-approve --no-extensions -e ./index.ts \
 Expected heading:
 
 ```text
-# Launchpad merge proposal search
+# Launchpad merge proposals for ~launchpad/launchpad/+git/launchpad
+```
+
+Test direct merge-proposal lookup by source branch:
+
+```sh
+omp -p --no-session --auto-approve --no-extensions -e ./index.ts \
+  'Use launchpad exactly once with op merge_proposal_for_branch, repository launchpad-ui, and branch manage-views-panel. Then print only the result heading.'
+```
+
+Expected heading:
+
+```text
+# Merge proposal lookup for ~launchpad-committers/launchpad-ui/+git/launchpad-ui:refs/heads/manage-views-panel
+```
+
+Test complete merge-proposal discussion aggregation:
+
+```sh
+omp -p --no-session --auto-approve --no-extensions -e ./index.ts \
+  'Use launchpad exactly once with op merge_proposal_discussion and target lp://~launchpad-committers/launchpad-ui/+git/launchpad-ui/+merge/511601. Then print only the result heading.'
+```
+
+Expected heading:
+
+```text
+# Merge proposal 511601 discussion
 ```
 
 Test repository file transport:
@@ -211,7 +237,7 @@ omp plugin link "$PWD"
 omp plugin list --json
 ```
 
-The list must show `omp-launchpad`, version `0.1.0`, with its path resolving to
+The list must show `omp-launchpad`, version `0.3.0`, with its path resolving to
 this checkout. Start a fresh OMP process and repeat the read-path smoke tests
 without `--no-extensions -e ./index.ts`:
 
@@ -233,7 +259,7 @@ To return to the published plugin after local testing, install the pinned npm
 package:
 
 ```sh
-omp plugin install omp-launchpad@0.1.0
+omp plugin install omp-launchpad@0.3.0
 ```
 
 ## Bridge-only diagnosis

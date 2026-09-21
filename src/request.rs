@@ -17,7 +17,7 @@ const REVIEW_VOTES: &[&str] = &[
     "Disapprove",
     "Needs Resubmitting",
 ];
-const MAX_RESULTS: usize = 50;
+const MAX_RESULTS: usize = 1_000;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -27,6 +27,8 @@ pub enum Operation {
     FileRead,
     SearchBugs,
     SearchMergeProposals,
+    MergeProposalForBranch,
+    MergeProposalDiscussion,
     PreviewDiffs,
     InlineComments,
     ReviewDrafts,
@@ -120,6 +122,7 @@ impl Request {
             Operation::FileRead => &[("repository", &self.repository), ("path", &self.path)],
             Operation::SearchBugs => &[("target", &self.target)],
             Operation::SearchMergeProposals => &[("repository", &self.repository)],
+            Operation::MergeProposalForBranch | Operation::MergeProposalDiscussion => &[],
             Operation::PreviewDiffs
             | Operation::InlineComments
             | Operation::ReviewDrafts
@@ -142,6 +145,11 @@ impl Request {
             Operation::MergeProposalCheckout => &[("target", &self.target)],
             Operation::MergeProposalPush => &[],
         };
+        match self.op {
+            Operation::MergeProposalForBranch => self.validate_branch_selector(false)?,
+            Operation::MergeProposalDiscussion => self.validate_branch_selector(true)?,
+            _ => {}
+        }
         for (name, value) in required {
             if value.as_deref().is_none_or(str::is_empty) {
                 return Err(Error::invalid(format!(
@@ -185,6 +193,11 @@ impl Request {
         if self.limit == Some(0) {
             return Err(Error::invalid("limit must be greater than zero"));
         }
+        if self.limit.is_some_and(|limit| limit > MAX_RESULTS) {
+            return Err(Error::invalid(format!(
+                "limit cannot exceed {MAX_RESULTS}; narrow the search or request multiple pages"
+            )));
+        }
         if self.op == Operation::FileRead {
             validate_repository_path(self.path("path")?)?;
         }
@@ -211,7 +224,7 @@ impl Request {
     }
 
     pub fn limit(&self) -> usize {
-        self.limit.unwrap_or(10).min(MAX_RESULTS)
+        self.limit.unwrap_or(10)
     }
 
     pub fn preview_diff_id(&self) -> Result<u64> {
@@ -265,6 +278,111 @@ impl Request {
             ))),
         }
     }
+
+    fn validate_branch_selector(&self, allow_target: bool) -> Result<()> {
+        let has_target = self
+            .target
+            .as_deref()
+            .is_some_and(|target| !target.trim().is_empty());
+        let has_repository = self
+            .repository
+            .as_deref()
+            .is_some_and(|repository| !repository.trim().is_empty());
+        let has_branch = self
+            .branch
+            .as_deref()
+            .is_some_and(|branch| !branch.trim().is_empty());
+
+        if has_target {
+            if !allow_target {
+                return Err(Error::invalid(format!(
+                    "target is not supported for {:?}; provide repository and branch",
+                    self.op
+                )));
+            }
+            if has_repository || has_branch {
+                return Err(Error::invalid(
+                    "target cannot be combined with repository or branch",
+                ));
+            }
+            return Ok(());
+        }
+        if has_repository == has_branch {
+            return Ok(());
+        }
+        Err(Error::invalid(
+            "repository and branch must be provided together; omit both to infer them from the current Git checkout",
+        ))
+    }
+}
+
+pub fn normalise_repository(raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(Error::invalid("repository cannot be empty"));
+    }
+
+    let path = if let Some(path) = raw.strip_prefix("lp://") {
+        path.to_owned()
+    } else if let Some(path) = raw.strip_prefix("lp:") {
+        path.trim_start_matches('/').to_owned()
+    } else if let Some(path) = raw.strip_prefix("git@git.launchpad.net:") {
+        path.to_owned()
+    } else if raw.contains("://") {
+        repository_path_from_url(raw)?
+    } else {
+        raw.trim_start_matches('/').to_owned()
+    };
+    let path = path
+        .split_once("/+merge/")
+        .map_or(path.as_str(), |(repository, _)| repository);
+    let path = path
+        .split_once("/+ref/")
+        .map_or(path, |(repository, _)| repository)
+        .trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    if path.is_empty() {
+        return Err(Error::invalid(
+            "repository must identify a Launchpad Git repository",
+        ));
+    }
+    Ok(path.to_owned())
+}
+
+fn repository_path_from_url(raw: &str) -> Result<String> {
+    let url = Url::parse(raw).map_err(|source| Error::Url {
+        url: raw.to_owned(),
+        source,
+    })?;
+    let host = url.host_str().unwrap_or_default();
+    if !matches!(
+        host,
+        "code.launchpad.net"
+            | "git.launchpad.net"
+            | "api.launchpad.net"
+            | "code.staging.launchpad.net"
+            | "git.staging.launchpad.net"
+            | "api.staging.launchpad.net"
+            | "code.qastaging.launchpad.net"
+            | "git.qastaging.launchpad.net"
+            | "api.qastaging.launchpad.net"
+    ) {
+        return Err(Error::invalid(format!(
+            "repository URL host {host:?} is not a Launchpad host; use a Launchpad clone URL, web URL, lp:// identifier, or repository path"
+        )));
+    }
+    let mut path = percent_decode_str(url.path().trim_start_matches('/'))
+        .decode_utf8()
+        .map_err(|source| Error::UrlEncoding {
+            reason: source.to_string(),
+        })?
+        .into_owned();
+    if host.starts_with("api.") {
+        path = path
+            .split_once('/')
+            .map_or(String::new(), |(_, resource)| resource.to_owned());
+    }
+    Ok(path)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -320,7 +438,7 @@ impl ResourceTarget {
         let preview_diff_id = query_preview_diff_id.or(path_preview_diff_id);
         if preview_diff_id.is_some() && !diff {
             return Err(Error::invalid(
-                "preview_diff is only valid for a merge proposal diff",
+                "preview_diff requires a merge proposal diff target such as lp://~owner/project/+git/repository/+merge/123/diff/456; use inline_comments with preview_diff_id to read published comments",
             ));
         }
         let path = normalise_bug_path(path);
@@ -443,7 +561,9 @@ fn classify_resource(path: &str) -> Result<ResourceKind> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Request, ResourceKind, ResourceTarget, validate_repository_path};
+    use super::{
+        Request, ResourceKind, ResourceTarget, normalise_repository, validate_repository_path,
+    };
 
     #[test]
     fn parses_bug_url_options() {
@@ -504,6 +624,87 @@ mod tests {
                 .to_string()
                 .contains("target and preview_diff_id select different snapshots")
         );
+    }
+
+    #[test]
+    fn normalises_repository_identifiers() {
+        let cases = [
+            ("launchpad-ui", "launchpad-ui"),
+            (
+                "lp://~goulinkh/launchpad-ui/+git/launchpad-ui",
+                "~goulinkh/launchpad-ui/+git/launchpad-ui",
+            ),
+            (
+                "https://code.launchpad.net/~goulinkh/launchpad-ui/+git/launchpad-ui",
+                "~goulinkh/launchpad-ui/+git/launchpad-ui",
+            ),
+            (
+                "https://git.launchpad.net/~goulinkh/launchpad-ui",
+                "~goulinkh/launchpad-ui",
+            ),
+            (
+                "git+ssh://git.launchpad.net/~goulinkh/launchpad-ui",
+                "~goulinkh/launchpad-ui",
+            ),
+            (
+                "git@git.launchpad.net:~goulinkh/launchpad-ui",
+                "~goulinkh/launchpad-ui",
+            ),
+            (
+                "https://code.launchpad.net/~owner/project/+git/repository/+ref/main",
+                "~owner/project/+git/repository",
+            ),
+            (
+                "lp://~owner/project/+git/repository/+merge/42",
+                "~owner/project/+git/repository",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(normalise_repository(input).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn validates_branch_lookup_selectors() {
+        let explicit: Request = serde_json::from_str(
+            r#"{
+                "op": "merge_proposal_for_branch",
+                "repository": "launchpad-ui",
+                "branch": "main"
+            }"#,
+        )
+        .unwrap();
+        explicit.validate().unwrap();
+
+        let inferred: Request =
+            serde_json::from_str(r#"{"op": "merge_proposal_for_branch"}"#).unwrap();
+        inferred.validate().unwrap();
+
+        let partial: Request = serde_json::from_str(
+            r#"{"op": "merge_proposal_for_branch", "repository": "launchpad-ui"}"#,
+        )
+        .unwrap();
+        assert!(
+            partial
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("must be provided together")
+        );
+    }
+
+    #[test]
+    fn accepts_paginated_search_limits() {
+        let request: Request = serde_json::from_str(
+            r#"{
+                "op": "search_merge_proposals",
+                "repository": "launchpad-ui",
+                "limit": 100
+            }"#,
+        )
+        .unwrap();
+        request.validate().unwrap();
+        assert_eq!(request.limit(), 100);
     }
 
     #[test]

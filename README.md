@@ -78,21 +78,27 @@ Bug and merge-proposal views include comments by default. Add `?comments=0` to o
 
 ## Tools
 
-| Tool              | Purpose                                                                                                                   |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `read`            | Read individual Launchpad resources and current or historical merge-proposal diffs through `lp://` URLs.                 |
-| `launchpad`       | View resources, search, inspect preview history and inline comments, retrieve drafts, and map file lines to diff lines.   |
-| `launchpad_write` | Create or update resources, update inline drafts, submit reviews, and check out or push merge-proposal branches.          |
+| Tool              | Purpose                                                                                                                       |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `read`            | Read individual Launchpad resources and current or historical merge-proposal diffs through `lp://` URLs.                     |
+| `launchpad`       | View resources, find proposals by branch, read threaded discussions and inline comments, inspect drafts and diffs, search, and map file locations. |
+| `launchpad_write` | Create or update resources, update inline drafts, submit reviews, and check out or push merge-proposal branches.              |
 
 The dedicated tools expose these operations:
 
-- `launchpad`: `resource_view`, `repo_view`, `file_read`, `search_bugs`, `search_merge_proposals`, `preview_diffs`, `inline_comments`, `review_drafts`, `diff_line_map`
+- `launchpad`: `resource_view`, `repo_view`, `file_read`, `search_bugs`, `search_merge_proposals`, `merge_proposal_for_branch`, `merge_proposal_discussion`, `preview_diffs`, `inline_comments`, `review_drafts`, `diff_line_map`
 - `launchpad_write`: `bug_create`, `merge_proposal_create`, `comment`, `review_draft_update`, `review_submit`, `set_merge_proposal_status`, `merge_proposal_checkout`, `merge_proposal_push`
 
 Example prompts:
 
 ```text
 Use launchpad to search bugs for target ubuntu with query installer and limit 5.
+
+Find the merge proposal for branch `fix-login` in repository `my-project`.
+
+Show the complete merge-proposal discussion for lp://~owner/project/+git/repository/+merge/123.
+
+Show the complete merge-proposal discussion for the current Git checkout.
 
 Use launchpad with op preview_diffs for lp://~owner/project/+git/repository/+merge/123.
 
@@ -102,6 +108,17 @@ Submit a review for preview diff 456 with vote Approve; include the saved inline
 
 Check out lp://~owner/project/+git/repository/+merge/123 into /tmp/proposal-123.
 ```
+
+Repository parameters accept short names, canonical paths, `lp://` identifiers,
+Launchpad web URLs, HTTPS clone URLs, SSH URLs, and `git@` clone URLs.
+`merge_proposal_for_branch` and `merge_proposal_discussion` infer the repository
+from the current checkout's `origin` remote and use its current branch when both
+parameters are omitted. Discussion results combine general comments, review
+activity, and inline threads from every preview diff, including stale status and
+resolved file locations.
+
+Searches paginate up to the requested limit. Limits above 1,000 are rejected
+explicitly rather than silently truncated.
 
 A merge-proposal checkout clones the source branch and adds the target repository as an `upstream` remote when it differs from the source. A push sends the current branch to `origin`; `force_with_lease` is available when explicitly requested.
 

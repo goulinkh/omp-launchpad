@@ -111,6 +111,7 @@ export default function launchpadExtension(pi: ExtensionAPI) {
   const withIntent = { i: z.string().optional() }
   const oneOrManyStrings = z.union([z.string(), z.array(z.string())])
   const positiveInteger = z.number().int().positive()
+  const limitInteger = positiveInteger.max(1000)
   const diffSide = z.enum(["original", "modified"])
   const reviewVote = z.enum([
     "Approve",
@@ -126,8 +127,9 @@ export default function launchpadExtension(pi: ExtensionAPI) {
     label: "Launchpad",
     description:
       "Read Launchpad through lpcli. Supports repository and resource views, repository file reads, searches, " +
-      "preview-diff history and selection, published inline comments, review drafts, and file-line mapping. " +
-      "Prefer read with lp:// URLs for individual bugs, merge proposals, and diff text.",
+      "direct merge-proposal lookup by branch, complete threaded proposal discussions, preview-diff history " +
+      "and selection, published inline comments, review drafts, and file-line mapping. Prefer read with lp:// " +
+      "URLs for individual bugs, merge proposals, and diff text.",
     parameters: z.union([
       z.object({
         op: z.literal("resource_view"),
@@ -150,14 +152,26 @@ export default function launchpadExtension(pi: ExtensionAPI) {
         status: oneOrManyStrings.optional(),
         importance: oneOrManyStrings.optional(),
         tags: z.array(z.string()).optional(),
-        limit: positiveInteger.optional(),
+        limit: limitInteger.optional(),
         ...withIntent,
       }),
       z.object({
         op: z.literal("search_merge_proposals"),
         repository: z.string(),
-        status: oneOrManyStrings.optional(),
-        limit: positiveInteger.optional(),
+        limit: limitInteger.optional(),
+        ...withIntent,
+      }),
+      z.object({
+        op: z.literal("merge_proposal_for_branch"),
+        repository: z.string().optional(),
+        branch: z.string().optional(),
+        ...withIntent,
+      }),
+      z.object({
+        op: z.literal("merge_proposal_discussion"),
+        target: z.string().optional(),
+        repository: z.string().optional(),
+        branch: z.string().optional(),
         ...withIntent,
       }),
       z.object({ op: z.literal("preview_diffs"), target: z.string(), ...withIntent }),
