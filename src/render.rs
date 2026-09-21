@@ -413,7 +413,7 @@ pub fn render_proposal_lookup(
     alternatives: &[Value],
     repository: &str,
     branch: &str,
-    inferred: bool,
+    resolution: &str,
 ) -> String {
     let mut lines = vec![format!("# Merge proposal lookup for {repository}:{branch}")];
     push_bullet(
@@ -421,15 +421,7 @@ pub fn render_proposal_lookup(
         "Matching proposals",
         Some((alternatives.len() + 1).to_string()),
     );
-    push_bullet(
-        &mut lines,
-        "Input",
-        Some(if inferred {
-            "current Git checkout".to_owned()
-        } else {
-            "explicit repository and branch".to_owned()
-        }),
-    );
+    push_bullet(&mut lines, "Resolved from", Some(resolution.to_owned()));
     lines.push(render_proposal_at_level(proposal, &[], &[], false, 1, 2));
     if !alternatives.is_empty() {
         let alternatives: Vec<_> = alternatives
@@ -451,13 +443,21 @@ pub fn render_proposal_lookup(
     lines.join("\n\n")
 }
 
+pub struct DiscussionSections {
+    pub general: bool,
+    pub inline: bool,
+    pub current_preview_diff_stale: bool,
+    pub identity_resolution_failures: usize,
+}
+
 pub fn render_proposal_discussion(
     proposal: &Value,
     comments: &[Value],
-    review_events: &[Value],
-    review_assignments: &[Value],
+    review_votes: &[Value],
+    review_requests: &[Value],
     preview_diffs: &[Value],
     current_preview_diff_id: Option<u64>,
+    sections: DiscussionSections,
 ) -> String {
     let id = resource_id(proposal).unwrap_or_else(|| "?".to_owned());
     let mut lines = vec![format!("# Merge proposal {id} discussion")];
@@ -477,57 +477,88 @@ pub fn render_proposal_discussion(
         "Current preview diff",
         current_preview_diff_id.map(|id| id.to_string()),
     );
+    if sections.current_preview_diff_stale {
+        push_bullet(
+            &mut lines,
+            "Current preview diff state",
+            Some("stale; unresolved inline threads are reported as outdated".to_owned()),
+        );
+    }
+    if sections.identity_resolution_failures > 0 {
+        push_bullet(
+            &mut lines,
+            "Identity resolution",
+            Some(format!(
+                "{} author profile(s) unavailable; usernames were derived from Launchpad URLs",
+                sections.identity_resolution_failures
+            )),
+        );
+    }
+    if sections.inline {
+        push_bullet(
+            &mut lines,
+            "Inline coverage",
+            Some("every preview diff unless narrowed by request filters".to_owned()),
+        );
+    }
 
-    let comment_lines: Vec<_> = comments.iter().map(render_discussion_comment).collect();
-    let comments_body = if comment_lines.is_empty() {
-        "No general comments.".to_owned()
-    } else {
-        comment_lines.join("\n\n")
-    };
-    push_section(&mut lines, "General comments", &comments_body);
-
-    let mut review_lines: Vec<_> = review_events
-        .iter()
-        .map(|review| {
-            let author = text_field(review, "author").unwrap_or("unknown");
-            let vote = text_field(review, "vote").unwrap_or("No vote");
-            let created = text_field(review, "created_at")
-                .map(|created| format!(" · {created}"))
-                .unwrap_or_default();
-            format!("- **{author}:** {vote}{created}")
-        })
-        .collect();
-    review_lines.extend(
-        review_assignments
+    if sections.general {
+        let comment_lines = comments
             .iter()
-            .filter(|assignment| {
-                assignment
-                    .get("pending")
-                    .and_then(Value::as_bool)
-                    .unwrap_or_default()
+            .map(render_discussion_comment)
+            .collect::<Vec<_>>();
+        let comments_body = if comment_lines.is_empty() {
+            "No written general comments.".to_owned()
+        } else {
+            comment_lines.join("\n\n")
+        };
+        push_section(&mut lines, "General comments", &comments_body);
+
+        let mut review_lines = review_votes
+            .iter()
+            .map(|review| {
+                let author = identity_label(review.get("author"));
+                let vote = text_field(review, "vote").unwrap_or("Review submitted");
+                let created = text_field(review, "created_at")
+                    .map(|created| format!(" · {created}"))
+                    .unwrap_or_default();
+                format!("- **{author}:** {vote}{created}")
             })
-            .map(|assignment| {
-                let reviewer = text_field(assignment, "reviewer").unwrap_or("unknown");
-                format!("- **{reviewer}:** Pending")
-            }),
-    );
-    let reviews_body = if review_lines.is_empty() {
-        "No review activity.".to_owned()
-    } else {
-        review_lines.join("\n")
-    };
-    push_section(&mut lines, "Review activity", &reviews_body);
+            .collect::<Vec<_>>();
+        review_lines.extend(
+            review_requests
+                .iter()
+                .filter(|assignment| {
+                    assignment
+                        .get("pending")
+                        .and_then(Value::as_bool)
+                        .unwrap_or_default()
+                })
+                .map(|assignment| {
+                    let reviewer = identity_label(assignment.get("reviewer"));
+                    format!("- **{reviewer}:** Pending")
+                }),
+        );
+        let reviews_body = if review_lines.is_empty() {
+            "No review activity.".to_owned()
+        } else {
+            review_lines.join("\n")
+        };
+        push_section(&mut lines, "Review activity", &reviews_body);
+    }
 
-    let inline_body = if preview_diffs.is_empty() {
-        "No preview diffs.".to_owned()
-    } else {
-        preview_diffs
-            .iter()
-            .map(render_preview_diff_discussion)
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    };
-    push_section(&mut lines, "Inline discussions", &inline_body);
+    if sections.inline {
+        let inline_body = if preview_diffs.is_empty() {
+            "No matching preview diffs.".to_owned()
+        } else {
+            preview_diffs
+                .iter()
+                .map(render_preview_diff_discussion)
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+        push_section(&mut lines, "Inline discussions", &inline_body);
+    }
     lines.join("\n\n")
 }
 
@@ -551,14 +582,9 @@ fn proposal_updated(proposal: &Value) -> Option<&str> {
 }
 
 fn render_discussion_comment(comment: &Value) -> String {
-    let author = text_field(comment, "author").unwrap_or("unknown");
+    let author = identity_label(comment.get("author"));
     let created = text_field(comment, "created_at");
-    let vote = text_field(comment, "vote");
-    let metadata = [created, vote]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" · ");
+    let metadata = created.into_iter().collect::<Vec<_>>().join(" · ");
     let heading = if metadata.is_empty() {
         format!("### {author}")
     } else {
@@ -570,31 +596,27 @@ fn render_discussion_comment(comment: &Value) -> String {
     if title.is_some_and(|title| body.is_none_or(|body| compact(title) != compact(body))) {
         lines.push(format!("**Subject:** {}", title.unwrap_or_default()));
     }
-    lines.push(body.map_or_else(
-        || "_No written comment._".to_owned(),
-        |body| body.trim().to_owned(),
-    ));
+    if let Some(body) = body {
+        lines.push(body.trim().to_owned());
+    }
     lines.join("\n\n")
 }
 
 fn render_preview_diff_discussion(preview_diff: &Value) -> String {
     let id = scalar_field(preview_diff, "preview_diff_id").unwrap_or_else(|| "?".to_owned());
-    let is_current = preview_diff
+    let current = if preview_diff
         .get("current")
-        .and_then(Value::as_bool)
-        .unwrap_or_default();
-    let current = if is_current { " · current" } else { "" };
-    let superseded = if is_current { "" } else { " · superseded" };
-    let stale = if preview_diff
-        .get("stale")
         .and_then(Value::as_bool)
         .unwrap_or_default()
     {
-        " · stale"
+        " · current"
     } else {
         ""
     };
-    let mut lines = vec![format!("### Preview diff {id}{current}{superseded}{stale}")];
+    let state = text_field(preview_diff, "state")
+        .map(|state| format!(" · {state}"))
+        .unwrap_or_default();
+    let mut lines = vec![format!("### Preview diff {id}{current}{state}")];
     let Some(threads) = preview_diff.get("threads").and_then(Value::as_array) else {
         lines.push("No inline comments.".to_owned());
         return lines.join("\n\n");
@@ -612,10 +634,11 @@ fn render_preview_diff_discussion(preview_diff: &Value) -> String {
                 ))
             })
             .unwrap_or_else(|| format!("diff line {diff_line}"));
-        lines.push(format!("#### {location_label}"));
+        let state = text_field(thread, "state").unwrap_or("unknown");
+        lines.push(format!("#### {location_label} · {state}"));
         if let Some(comments) = thread.get("comments").and_then(Value::as_array) {
             for comment in comments {
-                let author = text_field(comment, "author").unwrap_or("unknown");
+                let author = identity_label(comment.get("author"));
                 let created = text_field(comment, "created_at")
                     .map(|created| format!(" ({created})"))
                     .unwrap_or_default();
@@ -630,6 +653,22 @@ fn render_preview_diff_discussion(preview_diff: &Value) -> String {
         lines.push("No inline comments.".to_owned());
     }
     lines.join("\n\n")
+}
+
+fn identity_label(identity: Option<&Value>) -> String {
+    let Some(identity) = identity else {
+        return "unknown".to_owned();
+    };
+    let username = text_field(identity, "username");
+    let display_name = text_field(identity, "display_name");
+    match (display_name, username) {
+        (Some(display_name), Some(username)) if display_name != username => {
+            format!("{display_name} (@{username})")
+        }
+        (Some(display_name), _) => display_name.to_owned(),
+        (_, Some(username)) => format!("@{username}"),
+        _ => "unknown".to_owned(),
+    }
 }
 
 pub fn text_field<'value>(value: &'value Value, name: &str) -> Option<&'value str> {
@@ -802,7 +841,10 @@ fn capitalise(word: &str) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{render_inline_comments, render_review_drafts};
+    use super::{
+        DiscussionSections, render_inline_comments, render_proposal_discussion,
+        render_review_drafts,
+    };
 
     #[test]
     fn labels_empty_inline_comment_bodies() {
@@ -815,6 +857,38 @@ mod tests {
         ]);
         let text = render_inline_comments(comments.as_array().unwrap(), 12, "34");
         assert!(text.contains("No written comment."));
+    }
+
+    #[test]
+    fn renders_vote_only_events_as_review_activity() {
+        let proposal = json!({
+            "self_link": "https://api.launchpad.net/devel/~owner/project/+git/repository/+merge/42",
+            "web_link": "https://code.launchpad.net/~owner/project/+git/repository/+merge/42",
+        });
+        let review_votes = json!([{
+            "author": {
+                "username": "alice",
+                "display_name": "Alice Example"
+            },
+            "vote": "Approve",
+            "created_at": "2026-09-21T10:00:00Z"
+        }]);
+        let text = render_proposal_discussion(
+            &proposal,
+            &[],
+            review_votes.as_array().unwrap(),
+            &[],
+            &[],
+            Some(7),
+            DiscussionSections {
+                general: true,
+                inline: false,
+                current_preview_diff_stale: false,
+                identity_resolution_failures: 0,
+            },
+        );
+        assert!(text.contains("Alice Example (@alice):** Approve"));
+        assert!(!text.contains("_No written comment._"));
     }
 
     #[test]

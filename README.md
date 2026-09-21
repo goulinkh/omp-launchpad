@@ -100,6 +100,10 @@ Show the complete merge-proposal discussion for lp://~owner/project/+git/reposit
 
 Show the complete merge-proposal discussion for the current Git checkout.
 
+Show unresolved inline comments on the current diff for lp://~owner/project/+git/repository/+merge/123.
+
+Use launchpad with op merge_proposal_discussion, comments inline, current_diff_only true, reviewer alice, and since 2026-09-01T00:00:00Z.
+
 Use launchpad with op preview_diffs for lp://~owner/project/+git/repository/+merge/123.
 
 Map modified file line 42 in src/main.rs to a global diff line for preview diff 456, then save an inline draft there.
@@ -110,12 +114,29 @@ Check out lp://~owner/project/+git/repository/+merge/123 into /tmp/proposal-123.
 ```
 
 Repository parameters accept short names, canonical paths, `lp://` identifiers,
-Launchpad web URLs, HTTPS clone URLs, SSH URLs, and `git@` clone URLs.
+Launchpad web URLs, HTTPS clone URLs, SSH URLs, and `git@` clone URLs. If an
+explicit repository does not contain the requested branch proposal,
+`merge_proposal_for_branch` and branch-based `merge_proposal_discussion`
+search same-named and default repositories for the same Launchpad target. They
+identify the repository they resolved and fail with all candidates when the
+branch is ambiguous across repositories.
+
 `merge_proposal_for_branch` and `merge_proposal_discussion` infer the repository
 from the current checkout's `origin` remote and use its current branch when both
-parameters are omitted. Discussion results combine general comments, review
-activity, and inline threads from every preview diff, including stale status and
-resolved file locations.
+parameters are omitted.
+
+Discussion results contain readable Markdown followed by a `Structured data`
+JSON block. The same JSON is available in the tool result details. Stable fields
+include the proposal ID and URL, current preview-diff ID, review votes, written
+general comments, normalized author usernames and display names, and flattened
+inline threads with file, source/target line, diff line, replies, and state.
+By default, discussions include inline threads from every preview diff.
+`current_diff_only` narrows that history; `comments` accepts `all`, `general`,
+or `inline`; `since` accepts an RFC 3339 timestamp; and `reviewer` matches a
+Launchpad username or display name. `unresolved_only` returns current, open
+threads. Launchpad does not expose formal thread resolution, so current
+non-stale threads are `open`, stale threads are `outdated`, and non-current
+non-stale threads are `superseded`; no inferred `resolved` state is reported.
 
 Searches paginate up to the requested limit. Limits above 1,000 are rejected
 explicitly rather than silently truncated.

@@ -1,5 +1,8 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
+
+use chrono::{DateTime, FixedOffset};
+use futures::{StreamExt, stream};
 
 use lpcli::auth;
 use lpcli::client::{Collection, LaunchpadClient, urlenc};
@@ -22,6 +25,7 @@ use crate::result::Result;
 const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ITEMS: usize = 50;
 const MAX_BRANCH_FALLBACK_ITEMS: usize = 250;
+const MAX_REPOSITORY_CANDIDATES: usize = 100;
 
 pub async fn execute(request: &Request) -> Result<OperationResult> {
     request.validate()?;
@@ -412,26 +416,35 @@ async fn view_merge_proposal_for_branch(
     client: &LaunchpadClient,
     request: &Request,
 ) -> Result<OperationResult> {
-    let (repository, branch, inferred) = branch_selector(request).await?;
-    let (repository, proposal, alternatives) =
-        merge_proposal_for_branch(client, &repository, &branch).await?;
+    let (requested_repository, branch, inferred) = branch_selector(request).await?;
+    let (repository, proposal, alternatives, related_repository) =
+        merge_proposal_for_branch(client, &requested_repository, &branch).await?;
     let match_count = alternatives.len() + 1;
     let canonical_repository = render::text_field(&repository, "unique_name")
         .unwrap_or(repository_identifier(&repository));
     let source_url = render::text_field(&proposal, "web_link").map(str::to_owned);
+    let resolution = if inferred {
+        "current Git checkout"
+    } else if related_repository {
+        "related target repository"
+    } else {
+        "explicit repository and branch"
+    };
     let text = render::render_proposal_lookup(
         &proposal,
         &alternatives,
         canonical_repository,
         &normalise_ref(&branch),
-        inferred,
+        resolution,
     );
     let proposal_details = proposal_details(client, &proposal).await?;
     let details = json!({
         "kind": "merge_proposal_for_branch",
         "repository": canonical_repository,
+        "requested_repository": requested_repository,
         "branch": normalise_ref(&branch),
         "inferred": inferred,
+        "related_repository": related_repository,
         "matching_proposals": match_count,
         "proposal": proposal_details,
         "other_proposals": alternatives.iter().map(proposal_summary).collect::<Vec<_>>(),
@@ -453,52 +466,116 @@ async fn view_merge_proposal_discussion(
         let (_, proposal) = request_merge_proposal(client, request).await?;
         (proposal, None)
     } else {
-        let (repository, branch, inferred) = branch_selector(request).await?;
-        let (repository, proposal, alternatives) =
-            merge_proposal_for_branch(client, &repository, &branch).await?;
+        let (requested_repository, branch, inferred) = branch_selector(request).await?;
+        let (repository, proposal, alternatives, related_repository) =
+            merge_proposal_for_branch(client, &requested_repository, &branch).await?;
         let match_count = alternatives.len() + 1;
         let canonical_repository = render::text_field(&repository, "unique_name")
             .unwrap_or(repository_identifier(&repository));
         let lookup = json!({
             "repository": canonical_repository,
+            "requested_repository": requested_repository,
             "branch": normalise_ref(&branch),
             "inferred": inferred,
+            "related_repository": related_repository,
             "matching_proposals": match_count,
         });
         (proposal, Some(lookup))
     };
 
-    let comments_url = render::text_field(&proposal, "all_comments_collection_link")
-        .ok_or_else(|| Error::invalid("merge proposal has no comments collection"))?;
-    let general_comments = fetch_all_entries(client, comments_url).await?;
-    let votes_url = render::text_field(&proposal, "votes_collection_link")
-        .ok_or_else(|| Error::invalid("merge proposal has no review vote collection"))?;
-    let review_assignments = fetch_all_entries(client, votes_url).await?;
-    let preview_diffs = get_preview_diffs(client, &proposal).await?;
-    let current_preview_diff_id = if render::text_field(&proposal, "preview_diff_link").is_some() {
-        Some(preview_diff_id(
-            &get_preview_diff(client, &proposal, None).await?,
-        )?)
+    let comments_kind = request.comments.unwrap_or_default();
+    let since = request.since()?;
+    let reviewer = request.reviewer.as_deref().map(str::trim);
+    let (current_preview_diff_id, current_preview_diff_stale) =
+        if render::text_field(&proposal, "preview_diff_link").is_some() {
+            let current_preview_diff = get_preview_diff(client, &proposal, None).await?;
+            (
+                Some(preview_diff_id(&current_preview_diff)?),
+                current_preview_diff
+                    .get("stale")
+                    .and_then(Value::as_bool)
+                    .unwrap_or_default(),
+            )
+        } else {
+            (None, false)
+        };
+    let mut people = HashMap::new();
+    let mut identity_resolution_failures = HashSet::new();
+
+    let (general_comments, review_votes, review_requests) = if comments_kind.includes_general() {
+        let comments_url = render::text_field(&proposal, "all_comments_collection_link")
+            .ok_or_else(|| Error::invalid("merge proposal has no comments collection"))?;
+        let raw_comments = fetch_all_entries(client, comments_url).await?;
+        let votes_url = render::text_field(&proposal, "votes_collection_link")
+            .ok_or_else(|| Error::invalid("merge proposal has no review vote collection"))?;
+        let raw_review_requests = fetch_all_entries(client, votes_url).await?;
+        load_people(
+            client,
+            raw_comments.iter().chain(&raw_review_requests),
+            &mut people,
+            &mut identity_resolution_failures,
+        )
+        .await;
+        let comments = raw_comments
+            .iter()
+            .map(|comment| normalise_general_comment(comment, &people))
+            .collect::<Vec<_>>();
+        let general_comments = comments
+            .iter()
+            .filter(|comment| {
+                comment.get("body").is_some_and(|body| !body.is_null())
+                    && matches_discussion_filters(comment, "author", since.as_ref(), reviewer)
+            })
+            .cloned()
+            .collect();
+        let review_votes = comments
+            .into_iter()
+            .filter(|comment| {
+                comment.get("vote").is_some_and(|vote| !vote.is_null())
+                    && matches_discussion_filters(comment, "author", since.as_ref(), reviewer)
+            })
+            .collect();
+        let review_requests = raw_review_requests
+            .iter()
+            .map(|vote| normalise_review_assignment(vote, &people))
+            .filter(|assignment| {
+                matches_discussion_filters(assignment, "reviewer", since.as_ref(), reviewer)
+            })
+            .collect();
+        (general_comments, review_votes, review_requests)
     } else {
-        None
+        (Vec::new(), Vec::new(), Vec::new())
     };
-    let general_comments: Vec<_> = general_comments
-        .iter()
-        .map(normalise_general_comment)
-        .collect();
-    let review_events: Vec<_> = general_comments
-        .iter()
-        .filter(|comment| comment.get("vote").is_some_and(|vote| !vote.is_null()))
-        .cloned()
-        .collect();
-    let review_assignments: Vec<_> = review_assignments
-        .iter()
-        .map(normalise_review_assignment)
-        .collect();
+
+    let preview_diffs = if comments_kind.includes_inline() {
+        get_preview_diffs(client, &proposal).await?
+    } else {
+        Vec::new()
+    };
     let mut diff_discussions = Vec::with_capacity(preview_diffs.len());
+    let mut inline_threads = Vec::new();
     for preview_diff in &preview_diffs {
         let id = preview_diff_id(preview_diff)?;
+        let current = current_preview_diff_id == Some(id);
+        if request.current_diff_only.unwrap_or_default() && !current {
+            continue;
+        }
+        let stale = preview_diff
+            .get("stale")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let state = thread_state(current, stale);
+        if request.unresolved_only.unwrap_or_default() && state != "open" {
+            continue;
+        }
         let comments = inline_comments(client, &proposal, id).await?;
+        load_people(
+            client,
+            comments.iter(),
+            &mut people,
+            &mut identity_resolution_failures,
+        )
+        .await;
         let diff_text = if comments.is_empty() {
             None
         } else {
@@ -513,35 +590,53 @@ async fn view_merge_proposal_discussion(
                 })?;
             grouped.entry(line).or_default().push(comment);
         }
-        let threads: Vec<_> = grouped
-            .into_iter()
-            .map(|(line, mut comments)| {
-                comments.sort_by_key(|comment| render::text_field(comment, "date"));
-                let location = diff_text
-                    .as_deref()
-                    .and_then(|diff_text| diff::locate_diff_line(diff_text, line));
-                let comments: Vec<_> = comments
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, comment)| normalise_inline_comment(comment, index))
-                    .collect();
-                json!({
-                    "thread_id": format!("{id}:{line}"),
-                    "diff_line": line,
-                    "location": location,
-                    "comments": comments,
+        let mut threads = Vec::with_capacity(grouped.len());
+        for (line, mut comments) in grouped {
+            comments.sort_by_key(|comment| render::text_field(comment, "date"));
+            let location = diff_text
+                .as_deref()
+                .and_then(|diff_text| diff::locate_diff_line(diff_text, line));
+            let comments = comments
+                .into_iter()
+                .enumerate()
+                .map(|(index, comment)| normalise_inline_comment(comment, index, &people))
+                .filter(|comment| {
+                    matches_discussion_filters(comment, "author", since.as_ref(), reviewer)
                 })
-            })
-            .collect();
-        let stale = preview_diff
-            .get("stale")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+                .collect::<Vec<_>>();
+            if comments.is_empty() {
+                continue;
+            }
+            let source_line = location
+                .as_ref()
+                .filter(|location| location.side == diff::DiffSide::Original)
+                .map(|location| location.file_line);
+            let target_line = location
+                .as_ref()
+                .filter(|location| location.side == diff::DiffSide::Modified)
+                .map(|location| location.file_line);
+            let thread = json!({
+                "thread_id": format!("{id}:{line}"),
+                "preview_diff_id": id,
+                "current": current,
+                "stale": stale,
+                "state": state,
+                "diff_line": line,
+                "file": location.as_ref().map(|location| location.path.as_str()),
+                "source_line": source_line,
+                "target_line": target_line,
+                "location": location,
+                "comments": comments,
+            });
+            inline_threads.push(thread.clone());
+            threads.push(thread);
+        }
         diff_discussions.push(json!({
             "preview_diff_id": id,
             "date_created": render::text_field(preview_diff, "date_created"),
-            "current": current_preview_diff_id == Some(id),
+            "current": current,
             "stale": stale,
+            "state": state,
             "threads": threads,
         }));
     }
@@ -550,26 +645,81 @@ async fn view_merge_proposal_discussion(
             .and_then(Value::as_u64)
             .unwrap_or_default()
     });
+    inline_threads.sort_by_key(|thread| {
+        (
+            thread
+                .get("preview_diff_id")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            thread
+                .get("diff_line")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+        )
+    });
 
+    let preview_diff_summaries = diff_discussions
+        .iter()
+        .map(|preview_diff| {
+            json!({
+                "preview_diff_id": preview_diff.get("preview_diff_id"),
+                "date_created": preview_diff.get("date_created"),
+                "current": preview_diff.get("current"),
+                "stale": preview_diff.get("stale"),
+                "thread_count": preview_diff
+                    .get("threads")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
     let source_url = render::text_field(&proposal, "web_link").map(str::to_owned);
-    let text = render::render_proposal_discussion(
+    let markdown = render::render_proposal_discussion(
         &proposal,
         &general_comments,
-        &review_events,
-        &review_assignments,
+        &review_votes,
+        &review_requests,
         &diff_discussions,
         current_preview_diff_id,
+        render::DiscussionSections {
+            general: comments_kind.includes_general(),
+            inline: comments_kind.includes_inline(),
+            current_preview_diff_stale,
+            identity_resolution_failures: identity_resolution_failures.len(),
+        },
     );
+    let coverage = if !comments_kind.includes_inline() {
+        "not_requested"
+    } else if request.current_diff_only.unwrap_or_default()
+        || request.unresolved_only.unwrap_or_default()
+    {
+        "current_preview_diff"
+    } else {
+        "all_preview_diffs"
+    };
     let details = json!({
         "kind": "merge_proposal_discussion",
         "proposal": proposal_details(client, &proposal).await?,
         "lookup": lookup,
         "current_preview_diff_id": current_preview_diff_id,
+        "current_preview_diff_stale": current_preview_diff_stale,
+        "coverage": coverage,
+        "filters": {
+            "comments": comments_kind,
+            "current_diff_only": request.current_diff_only.unwrap_or_default(),
+            "unresolved_only": request.unresolved_only.unwrap_or_default(),
+            "since": request.since.as_deref(),
+            "reviewer": reviewer,
+        },
+        "identity_resolution_failures": identity_resolution_failures.len(),
+        "review_votes": review_votes,
         "general_comments": general_comments,
-        "review_events": review_events,
-        "review_assignments": review_assignments,
-        "preview_diffs": diff_discussions,
+        "review_requests": review_requests,
+        "inline_threads": inline_threads,
+        "preview_diffs": preview_diff_summaries,
     });
+    let text = format!("{markdown}\n\n## Structured data\n\n```json\n{details}\n```");
     Ok(OperationResult::new(text)
         .with_source_url(source_url)
         .with_details(details))
@@ -600,15 +750,83 @@ async fn merge_proposal_for_branch(
     client: &LaunchpadClient,
     repository_path: &str,
     branch: &str,
-) -> Result<(Value, Value, Vec<Value>)> {
+) -> Result<(Value, Value, Vec<Value>, bool)> {
     let repository = get_repository(client, repository_path).await?;
+    let branch = normalise_ref(branch);
+    let (proposals, requested_fallback_capped) =
+        repository_branch_proposals(client, &repository, &branch).await?;
+    if !proposals.is_empty() {
+        let (proposal, alternatives) = select_proposal(proposals)?;
+        return Ok((repository, proposal, alternatives, false));
+    }
+
+    let target_link = render::text_field(&repository, "target_link")
+        .ok_or_else(|| Error::invalid("Launchpad repository has no target"))?;
+    let repository_name = render::text_field(&repository, "name");
     let canonical_repository =
         render::text_field(&repository, "unique_name").unwrap_or(repository_path);
-    let branch = normalise_ref(branch);
+    let (related_repositories, truncated) =
+        target_repositories(client, target_link, repository_name).await?;
+    let mut matches = stream::iter(related_repositories)
+        .map(|related_repository| {
+            let branch = branch.as_str();
+            async move {
+                if render::text_field(&related_repository, "unique_name")
+                    == Some(canonical_repository)
+                {
+                    return None;
+                }
+                match related_repository_branch_proposals(client, &related_repository, branch).await
+                {
+                    Ok(proposals) if !proposals.is_empty() => Some((related_repository, proposals)),
+                    Ok(_) | Err(_) => None,
+                }
+            }
+        })
+        .buffer_unordered(8)
+        .filter_map(|candidate| async move { candidate })
+        .collect::<Vec<_>>()
+        .await;
+
+    if let Some(candidates) = ambiguous_branch_candidates(&matches, &branch) {
+        return Err(Error::invalid(format!(
+            "branch {branch} matches merge proposals in multiple repositories: {candidates}; provide an explicit merge proposal target"
+        )));
+    }
+    let Some((repository, proposals)) = matches.pop() else {
+        let requested_cap = if requested_fallback_capped {
+            format!(
+                "; the requested repository search was limited to its newest {MAX_BRANCH_FALLBACK_ITEMS} proposals"
+            )
+        } else {
+            String::new()
+        };
+        let related_cap = if truncated {
+            format!(
+                "; related lookup was limited to the first {MAX_REPOSITORY_CANDIDATES} likely repositories"
+            )
+        } else {
+            String::new()
+        };
+        return Err(Error::invalid(format!(
+            "no merge proposal found for {canonical_repository}:{branch} or another repository for the same target{requested_cap}{related_cap}"
+        )));
+    };
+    let (proposal, alternatives) = select_proposal(proposals)?;
+    Ok((repository, proposal, alternatives, true))
+}
+
+async fn repository_branch_proposals(
+    client: &LaunchpadClient,
+    repository: &Value,
+    branch: &str,
+) -> Result<(Vec<Value>, bool)> {
+    let canonical_repository = render::text_field(repository, "unique_name")
+        .ok_or_else(|| Error::invalid("Launchpad repository has no unique name"))?;
     let git_ref = list_git_refs(client, canonical_repository)
         .await?
         .into_iter()
-        .find(|git_ref| git_ref.path.as_deref() == Some(branch.as_str()));
+        .find(|git_ref| git_ref.path.as_deref() == Some(branch));
     let ref_exists = git_ref.is_some();
     let collection_url = if let Some(self_link) = git_ref
         .as_ref()
@@ -616,7 +834,7 @@ async fn merge_proposal_for_branch(
     {
         format!("{}/landing_targets", self_link.trim_end_matches('/'))
     } else {
-        render::text_field(&repository, "landing_targets_collection_link")
+        render::text_field(repository, "landing_targets_collection_link")
             .ok_or_else(|| Error::invalid("Launchpad repository has no merge proposal collection"))?
             .to_owned()
     };
@@ -626,24 +844,95 @@ async fn merge_proposal_for_branch(
         fetch_entries(client, &collection_url, MAX_BRANCH_FALLBACK_ITEMS).await?
     };
     let fallback_was_capped = !ref_exists && entries.len() == MAX_BRANCH_FALLBACK_ITEMS;
-    let mut proposals: Vec<_> = entries
+    let proposals = entries
         .into_iter()
-        .filter(|proposal| render::text_field(proposal, "source_git_path") == Some(branch.as_str()))
+        .filter(|proposal| render::text_field(proposal, "source_git_path") == Some(branch))
         .collect();
-    proposals.sort_by(|left, right| proposal_sort_key(left).cmp(&proposal_sort_key(right)));
+    Ok((proposals, fallback_was_capped))
+}
 
-    let proposal = proposals.pop().ok_or_else(|| {
-        if fallback_was_capped {
-            Error::invalid(format!(
-                "branch {branch} no longer exists in {canonical_repository} and no proposal was found in the newest {MAX_BRANCH_FALLBACK_ITEMS} repository proposals; pass an explicit merge proposal target"
-            ))
-        } else {
-            Error::invalid(format!(
-                "no merge proposal found for {canonical_repository}:{branch}"
-            ))
-        }
+async fn related_repository_branch_proposals(
+    client: &LaunchpadClient,
+    repository: &Value,
+    branch: &str,
+) -> Result<Vec<Value>> {
+    let repository_url = render::text_field(repository, "self_link")
+        .ok_or_else(|| Error::invalid("Launchpad repository has no API link"))?;
+    let mut ref_url = Url::parse(repository_url).map_err(|source| Error::Url {
+        url: repository_url.to_owned(),
+        source,
     })?;
-    Ok((repository, proposal, proposals))
+    ref_url
+        .query_pairs_mut()
+        .append_pair("ws.op", "getRefByPath")
+        .append_pair("path", branch);
+    let git_ref: Value = client.get_url(ref_url.as_str()).await?;
+    let ref_url = render::text_field(&git_ref, "self_link")
+        .ok_or_else(|| Error::invalid("Launchpad Git reference has no API link"))?;
+    let proposals = fetch_all_entries(
+        client,
+        &format!("{}/landing_targets", ref_url.trim_end_matches('/')),
+    )
+    .await?
+    .into_iter()
+    .filter(|proposal| render::text_field(proposal, "source_git_path") == Some(branch))
+    .collect();
+    Ok(proposals)
+}
+
+fn ambiguous_branch_candidates(matches: &[(Value, Vec<Value>)], branch: &str) -> Option<String> {
+    (matches.len() > 1).then(|| {
+        matches
+            .iter()
+            .map(|(repository, proposals)| {
+                let repository =
+                    render::text_field(repository, "unique_name").unwrap_or("unknown repository");
+                let proposal_ids = proposals
+                    .iter()
+                    .filter_map(render::resource_id)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{repository}:{branch} (MP {proposal_ids})")
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
+}
+
+async fn target_repositories(
+    client: &LaunchpadClient,
+    target_link: &str,
+    repository_name: Option<&str>,
+) -> Result<(Vec<Value>, bool)> {
+    let mut url = Url::parse(&client.url("/+git")).map_err(|source| Error::Url {
+        url: client.url("/+git"),
+        source,
+    })?;
+    url.query_pairs_mut()
+        .append_pair("ws.op", "getRepositories")
+        .append_pair("target", target_link)
+        .append_pair("order_by", "most recently changed first")
+        .append_pair("ws.size", &(MAX_REPOSITORY_CANDIDATES + 1).to_string());
+    let mut repositories =
+        fetch_entries(client, url.as_str(), MAX_REPOSITORY_CANDIDATES + 1).await?;
+    let truncated = repositories.len() > MAX_REPOSITORY_CANDIDATES;
+    repositories.truncate(MAX_REPOSITORY_CANDIDATES);
+    repositories.retain(|repository| {
+        render::text_field(repository, "name") == repository_name
+            || repository
+                .get("target_default")
+                .and_then(Value::as_bool)
+                .unwrap_or_default()
+    });
+    Ok((repositories, truncated))
+}
+
+fn select_proposal(mut proposals: Vec<Value>) -> Result<(Value, Vec<Value>)> {
+    proposals.sort_by(|left, right| proposal_sort_key(left).cmp(&proposal_sort_key(right)));
+    let proposal = proposals
+        .pop()
+        .ok_or_else(|| Error::invalid("cannot select a merge proposal from an empty result"))?;
+    Ok((proposal, proposals))
 }
 
 fn proposal_sort_key(proposal: &Value) -> (&str, u64) {
@@ -666,14 +955,48 @@ fn repository_identifier(repository: &Value) -> &str {
     render::text_field(repository, "web_link").unwrap_or("repository")
 }
 
-fn normalise_general_comment(comment: &Value) -> Value {
+async fn load_people<'entry>(
+    client: &LaunchpadClient,
+    entries: impl Iterator<Item = &'entry Value>,
+    people: &mut HashMap<String, Value>,
+    failures: &mut HashSet<String>,
+) {
+    let mut links = HashSet::new();
+    for entry in entries {
+        for field in ["author", "owner", "person", "reviewer", "registrant"] {
+            if let Some(link) = person_link(entry, field)
+                && !people.contains_key(link)
+                && !failures.contains(link)
+            {
+                links.insert(link.to_owned());
+            }
+        }
+    }
+    let loaded = stream::iter(links)
+        .map(|link| async move {
+            let person = client.get_url(&link).await.ok();
+            (link, person)
+        })
+        .buffer_unordered(8)
+        .collect::<Vec<_>>()
+        .await;
+    for (link, person) in loaded {
+        if let Some(person) = person {
+            people.insert(link, person);
+        } else {
+            failures.insert(link);
+        }
+    }
+}
+
+fn normalise_general_comment(comment: &Value, people: &HashMap<String, Value>) -> Value {
     let body = render::text_field(comment, "message_body")
         .or_else(|| render::text_field(comment, "content"))
         .filter(|body| !body.trim().is_empty());
     json!({
         "id": comment.get("id"),
-        "author": render::person_field(comment, "author")
-            .or_else(|| render::person_field(comment, "owner")),
+        "author": normalise_identity(comment, "author", people)
+            .or_else(|| normalise_identity(comment, "owner", people)),
         "created_at": render::text_field(comment, "date_created"),
         "vote": render::text_field(comment, "vote"),
         "title": render::text_field(comment, "title"),
@@ -682,26 +1005,116 @@ fn normalise_general_comment(comment: &Value) -> Value {
     })
 }
 
-fn normalise_inline_comment(comment: &Value, index: usize) -> Value {
+fn normalise_inline_comment(
+    comment: &Value,
+    index: usize,
+    people: &HashMap<String, Value>,
+) -> Value {
     let body = render::text_field(comment, "text").filter(|body| !body.trim().is_empty());
     json!({
         "sequence": index + 1,
-        "author": render::person_field(comment, "person"),
+        "author": normalise_identity(comment, "person", people),
         "created_at": render::text_field(comment, "date"),
         "body": body,
     })
 }
 
-fn normalise_review_assignment(vote: &Value) -> Value {
+fn normalise_review_assignment(vote: &Value, people: &HashMap<String, Value>) -> Value {
     json!({
-        "reviewer": render::person_field(vote, "reviewer"),
-        "registrant": render::person_field(vote, "registrant"),
+        "reviewer": normalise_identity(vote, "reviewer", people),
+        "registrant": normalise_identity(vote, "registrant", people),
         "created_at": render::text_field(vote, "date_created"),
         "review_type": render::text_field(vote, "review_type"),
         "pending": vote.get("is_pending").and_then(Value::as_bool),
         "comment_url": render::text_field(vote, "comment_link"),
         "url": render::text_field(vote, "web_link"),
     })
+}
+
+fn normalise_identity(
+    value: &Value,
+    field: &str,
+    people: &HashMap<String, Value>,
+) -> Option<Value> {
+    let link = person_link(value, field);
+    let person = value
+        .get(field)
+        .filter(|person| person.is_object())
+        .or_else(|| link.and_then(|link| people.get(link)));
+    if person.is_none() && link.is_none() {
+        return None;
+    }
+    let username = person
+        .and_then(|person| render::text_field(person, "name"))
+        .or_else(|| {
+            link.and_then(|link| {
+                link.trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .map(|name| name.trim_start_matches('~'))
+            })
+        });
+    let display_name = person
+        .and_then(|person| render::text_field(person, "display_name"))
+        .or(username);
+    let url = person
+        .and_then(|person| render::text_field(person, "web_link"))
+        .map(str::to_owned)
+        .or_else(|| username.map(|username| format!("https://launchpad.net/~{username}")));
+    Some(json!({
+        "username": username,
+        "display_name": display_name,
+        "url": url,
+    }))
+}
+
+fn person_link<'value>(value: &'value Value, field: &str) -> Option<&'value str> {
+    let link_field = match field {
+        "author" => Some("author_link"),
+        "owner" => Some("owner_link"),
+        "person" => Some("person_link"),
+        "reviewer" => Some("reviewer_link"),
+        "registrant" => Some("registrant_link"),
+        _ => None,
+    };
+    value
+        .get(field)
+        .and_then(|person| render::text_field(person, "self_link"))
+        .or_else(|| link_field.and_then(|link_field| render::text_field(value, link_field)))
+        .or_else(|| value.get(field).and_then(Value::as_str))
+}
+
+fn matches_discussion_filters(
+    value: &Value,
+    identity_field: &str,
+    since: Option<&DateTime<FixedOffset>>,
+    reviewer: Option<&str>,
+) -> bool {
+    let after_since = since.is_none_or(|since| {
+        render::text_field(value, "created_at")
+            .and_then(|created| DateTime::parse_from_rfc3339(created).ok())
+            .is_none_or(|created| created >= *since)
+    });
+    let matches_reviewer = reviewer.is_none_or(|reviewer| {
+        let reviewer = reviewer.trim_start_matches('~');
+        value.get(identity_field).is_some_and(|identity| {
+            ["username", "display_name"]
+                .into_iter()
+                .filter_map(|field| render::text_field(identity, field))
+                .any(|candidate| candidate.eq_ignore_ascii_case(reviewer))
+        })
+    });
+    after_since && matches_reviewer
+}
+
+fn thread_state(current: bool, stale: bool) -> &'static str {
+    if stale {
+        "outdated"
+    } else if current {
+        "open"
+    } else {
+        "superseded"
+    }
 }
 
 async fn create_bug(client: &LaunchpadClient, request: &Request) -> Result<OperationResult> {
@@ -1347,6 +1760,8 @@ async fn proposal_details(client: &LaunchpadClient, proposal: &Value) -> Result<
     Ok(json!({
         "kind": "branch_merge_proposal",
         "id": render::resource_id(proposal),
+        "url": render::scalar_field(proposal, "web_link"),
+        "status": render::scalar_field(proposal, "queue_status"),
         "source_ref": render::scalar_field(proposal, "source_git_path"),
         "target_ref": render::scalar_field(proposal, "target_git_path"),
         "source_repository": render::scalar_field(&source_repository, "unique_name"),
@@ -1441,9 +1856,92 @@ fn floor_char_boundary(value: &str, index: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use chrono::DateTime;
     use serde_json::json;
 
-    use super::validate_current_preview_diff;
+    use super::{
+        ambiguous_branch_candidates, matches_discussion_filters, normalise_inline_comment,
+        thread_state, validate_current_preview_diff,
+    };
+
+    #[test]
+    fn reports_ambiguous_branch_repositories() {
+        let matches = vec![
+            (
+                json!({ "unique_name": "~alice/project/+git/project" }),
+                vec![
+                    json!({ "self_link": "https://api.launchpad.net/devel/~alice/project/+git/project/+merge/10" }),
+                ],
+            ),
+            (
+                json!({ "unique_name": "~bob/project/+git/project" }),
+                vec![
+                    json!({ "self_link": "https://api.launchpad.net/devel/~bob/project/+git/project/+merge/20" }),
+                ],
+            ),
+        ];
+        let candidates = ambiguous_branch_candidates(&matches, "refs/heads/fix").unwrap();
+        assert!(candidates.contains("~alice/project/+git/project:refs/heads/fix (MP 10)"));
+        assert!(candidates.contains("~bob/project/+git/project:refs/heads/fix (MP 20)"));
+    }
+
+    #[test]
+    fn classifies_thread_state_from_preview_diff() {
+        assert_eq!(thread_state(true, false), "open");
+        assert_eq!(thread_state(false, false), "superseded");
+        assert_eq!(thread_state(false, true), "outdated");
+    }
+
+    #[test]
+    fn filters_comments_by_timestamp_and_normalised_identity() {
+        let comment = normalise_inline_comment(
+            &json!({
+                "person": {
+                    "name": "alice",
+                    "display_name": "Alice Example",
+                    "web_link": "https://launchpad.net/~alice"
+                },
+                "date": "2026-09-21T10:00:00+00:00",
+                "text": "Review comment"
+            }),
+            0,
+            &HashMap::new(),
+        );
+        let since = DateTime::parse_from_rfc3339("2026-09-21T09:59:00Z").unwrap();
+        assert!(matches_discussion_filters(
+            &comment,
+            "author",
+            Some(&since),
+            Some("alice"),
+        ));
+        assert!(matches_discussion_filters(
+            &comment,
+            "author",
+            Some(&since),
+            Some("Alice Example"),
+        ));
+        assert!(!matches_discussion_filters(
+            &comment,
+            "author",
+            Some(&since),
+            Some("bob"),
+        ));
+        let malformed = json!({
+            "author": {
+                "username": "alice",
+                "display_name": "Alice Example"
+            },
+            "created_at": "not-a-timestamp"
+        });
+        assert!(matches_discussion_filters(
+            &malformed,
+            "author",
+            Some(&since),
+            None,
+        ));
+    }
 
     #[test]
     fn rejects_non_current_preview_diff() {

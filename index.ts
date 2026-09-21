@@ -126,9 +126,10 @@ export default function launchpadExtension(pi: ExtensionAPI) {
     name: "launchpad",
     label: "Launchpad",
     description:
-      "Read Launchpad through lpcli. Supports repository and resource views, repository file reads, searches, " +
-      "direct merge-proposal lookup by branch, complete threaded proposal discussions, preview-diff history " +
-      "and selection, published inline comments, review drafts, and file-line mapping. Prefer read with lp:// " +
+      "Read Launchpad through lpcli. Repository inputs accept Launchpad paths and Git remote URLs. Branch lookup " +
+      "searches repositories for the same target when needed and reports ambiguous matches. Discussion results " +
+      "include structured general comments, review votes, identities, and inline threads from every preview diff; " +
+      "filters can select current/open inline threads, comment kinds, time, or reviewer. Prefer read with lp:// " +
       "URLs for individual bugs, merge proposals, and diff text.",
     parameters: z.union([
       z.object({
@@ -172,6 +173,11 @@ export default function launchpadExtension(pi: ExtensionAPI) {
         target: z.string().optional(),
         repository: z.string().optional(),
         branch: z.string().optional(),
+        current_diff_only: z.boolean().optional(),
+        unresolved_only: z.boolean().optional(),
+        comments: z.enum(["all", "general", "inline"]).optional(),
+        since: z.string().optional(),
+        reviewer: z.string().optional(),
         ...withIntent,
       }),
       z.object({ op: z.literal("preview_diffs"), target: z.string(), ...withIntent }),

@@ -1,7 +1,8 @@
 use std::path::Path;
 
+use chrono::{DateTime, FixedOffset};
 use percent_encoding::percent_decode_str;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::diff::DiffSide;
@@ -84,6 +85,25 @@ impl OneOrMany {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscussionComments {
+    #[default]
+    All,
+    General,
+    Inline,
+}
+
+impl DiscussionComments {
+    pub fn includes_general(self) -> bool {
+        matches!(self, Self::All | Self::General)
+    }
+
+    pub fn includes_inline(self) -> bool {
+        matches!(self, Self::All | Self::Inline)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Request {
     pub op: Operation,
@@ -98,6 +118,11 @@ pub struct Request {
     pub tags: Option<Vec<String>>,
     pub limit: Option<usize>,
     pub preview_diff_id: Option<u64>,
+    pub current_diff_only: Option<bool>,
+    pub unresolved_only: Option<bool>,
+    pub comments: Option<DiscussionComments>,
+    pub since: Option<String>,
+    pub reviewer: Option<String>,
     pub file_line: Option<u64>,
     pub side: Option<DiffSide>,
     pub title: Option<String>,
@@ -201,6 +226,32 @@ impl Request {
         if self.op == Operation::FileRead {
             validate_repository_path(self.path("path")?)?;
         }
+        let has_discussion_filters = self.current_diff_only.is_some()
+            || self.unresolved_only.is_some()
+            || self.comments.is_some()
+            || self.since.is_some()
+            || self.reviewer.is_some();
+        if has_discussion_filters && self.op != Operation::MergeProposalDiscussion {
+            return Err(Error::invalid(
+                "comment filters are supported only for merge_proposal_discussion",
+            ));
+        }
+        if self.comments == Some(DiscussionComments::General)
+            && (self.current_diff_only.unwrap_or_default()
+                || self.unresolved_only.unwrap_or_default())
+        {
+            return Err(Error::invalid(
+                "current_diff_only and unresolved_only require inline comments",
+            ));
+        }
+        self.since()?;
+        if self
+            .reviewer
+            .as_deref()
+            .is_some_and(|reviewer| reviewer.trim().is_empty())
+        {
+            return Err(Error::invalid("reviewer cannot be empty"));
+        }
         Ok(())
     }
 
@@ -277,6 +328,19 @@ impl Request {
                 self.op
             ))),
         }
+    }
+
+    pub fn since(&self) -> Result<Option<DateTime<FixedOffset>>> {
+        self.since
+            .as_deref()
+            .map(|since| {
+                DateTime::parse_from_rfc3339(since).map_err(|_| {
+                    Error::invalid(
+                        "since must be an RFC 3339 timestamp such as 2026-09-21T09:30:00Z",
+                    )
+                })
+            })
+            .transpose()
     }
 
     fn validate_branch_selector(&self, allow_target: bool) -> Result<()> {
@@ -562,7 +626,8 @@ fn classify_resource(path: &str) -> Result<ResourceKind> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Request, ResourceKind, ResourceTarget, normalise_repository, validate_repository_path,
+        DiscussionComments, Request, ResourceKind, ResourceTarget, normalise_repository,
+        validate_repository_path,
     };
 
     #[test]
@@ -647,6 +712,10 @@ mod tests {
                 "~goulinkh/launchpad-ui",
             ),
             (
+                "ssh://git@git.launchpad.net/~goulinkh/launchpad-ui.git",
+                "~goulinkh/launchpad-ui",
+            ),
+            (
                 "git@git.launchpad.net:~goulinkh/launchpad-ui",
                 "~goulinkh/launchpad-ui",
             ),
@@ -690,6 +759,58 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("must be provided together")
+        );
+    }
+
+    #[test]
+    fn validates_discussion_filters() {
+        let request: Request = serde_json::from_str(
+            r#"{
+                "op": "merge_proposal_discussion",
+                "target": "lp://~owner/project/+git/repository/+merge/42",
+                "current_diff_only": true,
+                "unresolved_only": true,
+                "comments": "inline",
+                "since": "2026-09-21T09:30:00Z",
+                "reviewer": "alice"
+            }"#,
+        )
+        .unwrap();
+        request.validate().unwrap();
+        assert_eq!(request.comments, Some(DiscussionComments::Inline));
+        assert!(request.since().unwrap().is_some());
+
+        let invalid_timestamp: Request = serde_json::from_str(
+            r#"{
+                "op": "merge_proposal_discussion",
+                "target": "lp://~owner/project/+git/repository/+merge/42",
+                "since": "yesterday"
+            }"#,
+        )
+        .unwrap();
+        assert!(
+            invalid_timestamp
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("RFC 3339")
+        );
+
+        let incompatible: Request = serde_json::from_str(
+            r#"{
+                "op": "merge_proposal_discussion",
+                "target": "lp://~owner/project/+git/repository/+merge/42",
+                "comments": "general",
+                "unresolved_only": true
+            }"#,
+        )
+        .unwrap();
+        assert!(
+            incompatible
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("require inline comments")
         );
     }
 
