@@ -108,25 +108,7 @@ fn api_base_url() -> Result<String> {
 
 async fn view_resource(client: &LaunchpadClient, request: &Request) -> Result<OperationResult> {
     let mut target = ResourceTarget::parse(request.target()?)?;
-    if let Some(preview_diff_id) = request.preview_diff_id {
-        if preview_diff_id == 0 {
-            return Err(Error::invalid("preview_diff_id must be greater than zero"));
-        }
-        if !target.diff {
-            return Err(Error::invalid(
-                "preview_diff_id requires a merge proposal diff target such as lp://~owner/project/+git/repository/+merge/123/diff/456; use inline_comments to read published comments for a snapshot",
-            ));
-        }
-        if target
-            .preview_diff_id
-            .is_some_and(|id| id != preview_diff_id)
-        {
-            return Err(Error::invalid(
-                "target and preview_diff_id select different snapshots",
-            ));
-        }
-        target.preview_diff_id = Some(preview_diff_id);
-    }
+    select_preview_diff(&mut target, request.preview_diff_id)?;
     match &target.kind {
         ResourceKind::Bug { id } => view_bug(client, &target, *id).await,
         ResourceKind::MergeProposal { repository, id } => {
@@ -159,6 +141,34 @@ async fn view_resource(client: &LaunchpadClient, request: &Request) -> Result<Op
                 .with_details(details))
         }
     }
+}
+
+fn select_preview_diff(target: &mut ResourceTarget, preview_diff_id: Option<u64>) -> Result<()> {
+    let Some(preview_diff_id) = preview_diff_id else {
+        return Ok(());
+    };
+    if preview_diff_id == 0 {
+        return Err(Error::invalid("preview_diff_id must be greater than zero"));
+    }
+    if !matches!(
+        &target.kind,
+        ResourceKind::MergeProposal { .. } | ResourceKind::MergeProposalId { .. }
+    ) {
+        return Err(Error::invalid(
+            "preview_diff_id requires a merge proposal target",
+        ));
+    }
+    if target
+        .preview_diff_id
+        .is_some_and(|id| id != preview_diff_id)
+    {
+        return Err(Error::invalid(
+            "target and preview_diff_id select different snapshots",
+        ));
+    }
+    target.diff = true;
+    target.preview_diff_id = Some(preview_diff_id);
+    Ok(())
 }
 
 async fn view_bug(
@@ -2253,10 +2263,59 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        eligible_proposals, matches_discussion_filters, normalise_inline_comment, select_proposal,
-        thread_state, validate_current_preview_diff,
+        eligible_proposals, matches_discussion_filters, normalise_inline_comment,
+        select_preview_diff, select_proposal, thread_state, validate_current_preview_diff,
     };
-    use crate::request::Request;
+    use crate::request::{Request, ResourceTarget};
+
+    #[test]
+    fn selects_preview_diff_for_numeric_merge_proposal() {
+        let mut target = ResourceTarget::parse("510799").unwrap();
+        select_preview_diff(&mut target, Some(1_142_878)).unwrap();
+        assert!(target.diff);
+        assert_eq!(target.preview_diff_id, Some(1_142_878));
+    }
+
+    #[test]
+    fn selects_preview_diff_for_merge_proposal_url() {
+        let mut target =
+            ResourceTarget::parse("lp://~owner/project/+git/repository/+merge/510799").unwrap();
+        select_preview_diff(&mut target, Some(1_142_878)).unwrap();
+        assert!(target.diff);
+        assert_eq!(target.preview_diff_id, Some(1_142_878));
+    }
+
+    #[test]
+    fn accepts_matching_resource_preview_diff() {
+        let mut target =
+            ResourceTarget::parse("lp://~owner/project/+git/repository/+merge/42/diff/17").unwrap();
+        select_preview_diff(&mut target, Some(17)).unwrap();
+        assert!(target.diff);
+        assert_eq!(target.preview_diff_id, Some(17));
+    }
+
+    #[test]
+    fn rejects_conflicting_resource_preview_diff() {
+        let mut target =
+            ResourceTarget::parse("lp://~owner/project/+git/repository/+merge/42/diff/17").unwrap();
+        let error = select_preview_diff(&mut target, Some(18)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("target and preview_diff_id select different snapshots")
+        );
+    }
+
+    #[test]
+    fn rejects_preview_diff_for_non_merge_proposal() {
+        let mut target = ResourceTarget::parse("lp://bugs/1").unwrap();
+        let error = select_preview_diff(&mut target, Some(17)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("preview_diff_id requires a merge proposal target")
+        );
+    }
 
     #[test]
     fn prefers_active_proposal_unless_latest_is_requested() {

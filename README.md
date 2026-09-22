@@ -89,6 +89,8 @@ The dedicated tools expose these operations:
 - `launchpad`: `resource_view`, `repo_view`, `file_read`, `search_bugs`, `search_merge_proposals`, `merge_proposal_for_branch`, `current_merge_proposal`, `merge_proposal_discussion`, `preview_diffs`, `inline_comments`, `review_drafts`, `diff_line_map`
 - `launchpad_write`: `bug_create`, `merge_proposal_create`, `comment`, `review_draft_update`, `review_submit`, `set_merge_proposal_status`, `merge_proposal_checkout`, `merge_proposal_push`
 
+For `resource_view`, `preview_diff_id` selects that snapshot's diff. The target may be a numeric merge-proposal ID or a merge-proposal URL and does not need a `/diff` suffix.
+
 Example prompts:
 
 ```text

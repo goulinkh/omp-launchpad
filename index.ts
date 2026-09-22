@@ -142,7 +142,9 @@ export default function launchpadExtension(pi: ExtensionAPI) {
       z.object({
         op: z.literal("resource_view"),
         target: mergeProposalTarget,
-        preview_diff_id: positiveInteger.optional(),
+        preview_diff_id: positiveInteger
+          .optional()
+          .describe("Selects that preview-diff snapshot's diff; the merge-proposal target needs no /diff suffix."),
         ...withIntent,
       }),
       z.object({ op: z.literal("repo_view"), repository: z.string(), ...withIntent }),
