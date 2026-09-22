@@ -1,6 +1,6 @@
 {
   "name": "omp-launchpad",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Launchpad resources and operations for Oh My Pi",
   "type": "module",
   "repository": {

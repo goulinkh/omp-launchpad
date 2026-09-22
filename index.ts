@@ -5,6 +5,7 @@ import type {
 import { existsSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
+import { LaunchpadStatusController } from "./src/status"
 
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const MANIFEST_PATH = join(PLUGIN_DIR, "Cargo.toml")
@@ -43,6 +44,9 @@ interface BridgeToolResult {
 
 export default function launchpadExtension(pi: ExtensionAPI) {
   const z = pi.zod
+  const status = new LaunchpadStatusController((signal, cwd) =>
+    runBridge({ op: "current_merge_proposal" }, signal, cwd)
+  )
 
   pi.setLabel("Launchpad")
   pi.registerCommand("launchpad", {
@@ -62,12 +66,20 @@ export default function launchpadExtension(pi: ExtensionAPI) {
       const command = args.trim().toLowerCase()
       try {
         if (command === "login") {
-          await login(pi, ctx)
+          if (await login(pi, ctx)) {
+            status.clear(ctx)
+            status.refresh(ctx)
+          }
           return
         }
         if (command === "logout" || command === "status") {
           const output = await runCommand(command, ctx.cwd)
           ctx.ui.notify(output, "info")
+          if (command === "logout") {
+            status.clear(ctx)
+          } else {
+            status.refresh(ctx)
+          }
           return
         }
         ctx.ui.notify("Usage: /launchpad login | logout | status", "warning")
@@ -77,6 +89,23 @@ export default function launchpadExtension(pi: ExtensionAPI) {
     },
   })
 
+  pi.on("session_start", (_event, ctx) => {
+    status.refresh(ctx)
+  })
+  pi.on("session_switch", (_event, ctx) => {
+    status.refresh(ctx)
+  })
+  pi.on("turn_end", (_event, ctx) => {
+    status.refresh(ctx)
+  })
+  pi.on("tool_execution_end", (event, ctx) => {
+    if (event.toolName === "launchpad_write" && !event.isError) {
+      status.refresh(ctx)
+    }
+  })
+  pi.on("session_shutdown", () => {
+    status.dispose()
+  })
 
   pi.registerTool({
     name: "read",
@@ -307,7 +336,7 @@ export default function launchpadExtension(pi: ExtensionAPI) {
     },
   })
 }
-async function login(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
+async function login(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<boolean> {
   if (!ctx.hasUI) {
     throw new Error("/launchpad login requires an interactive OMP session")
   }
@@ -349,7 +378,7 @@ async function login(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<vo
     child.stdin.end()
     await child.exited
     ctx.ui.notify("Launchpad login cancelled", "warning")
-    return
+    return false
   }
 
   child.stdin.write("\n")
@@ -365,6 +394,7 @@ async function login(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<vo
     throw new Error(stderr.trim() || stdout.trim() || `Launchpad login exited with status ${exitCode}`)
   }
   ctx.ui.notify("Logged in to Launchpad", "info")
+  return true
 }
 
 async function openBrowser(pi: ExtensionAPI, url: string, cwd: string): Promise<boolean> {
