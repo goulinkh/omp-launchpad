@@ -21,10 +21,7 @@
   "files": [
     "index.ts",
     "bin",
-    "Cargo.toml",
-    "Cargo.lock",
-    "rust-toolchain.toml",
-    "src",
+    "src/status.ts",
     "assets"
   ],
   "omp": {

@@ -48,8 +48,27 @@ const packOutput = execFileSync(
   }
 )
 const packs = JSON.parse(packOutput)
-if (!Array.isArray(packs) || packs.length !== 1 || typeof packs[0].filename !== "string") {
+if (
+  !Array.isArray(packs) ||
+  packs.length !== 1 ||
+  typeof packs[0].filename !== "string" ||
+  !Array.isArray(packs[0].files)
+) {
   throw new Error("npm pack returned an unexpected result")
+}
+
+const packedFiles = new Set(packs[0].files.map(file => file.path))
+for (const [platform, architecture] of targets) {
+  const extension = platform === "win32" ? ".exe" : ""
+  const binaryPath = `bin/omp-launchpad-${platform}-${architecture}${extension}`
+  if (!packedFiles.has(binaryPath)) {
+    throw new Error(`npm package is missing ${binaryPath}`)
+  }
+}
+for (const sourcePath of ["Cargo.lock", "Cargo.toml", "rust-toolchain.toml"]) {
+  if (packedFiles.has(sourcePath)) {
+    throw new Error(`npm package unexpectedly contains ${sourcePath}`)
+  }
 }
 
 const npmArchive = join(npmDistributionDirectory, "omp-launchpad.tgz")

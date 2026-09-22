@@ -29,12 +29,12 @@ Search project bugs and repository merge proposals. Authenticated operations can
 - Supports authenticated `lpcli` credentials and anonymous public access.
 - Supports production, staging, and custom Launchpad API endpoints.
 - Provides native release binaries for Linux, macOS, and Windows on x64 and arm64.
-- Falls back to building with Cargo when no packaged binary is available.
+- Uses Cargo only when running directly from a source checkout.
 
 ## Install
 
 Install the npm package. It contains the published Rust binaries for every
-supported platform, so installation does not build repository source:
+supported platform and does not contain or build Rust source:
 
 ```sh
 omp plugin install omp-launchpad

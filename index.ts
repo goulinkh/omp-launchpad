@@ -504,6 +504,11 @@ function bridgeCommand(): string[] {
   if (existsSync(packagedBinary)) {
     return [packagedBinary]
   }
+  if (!existsSync(MANIFEST_PATH)) {
+    throw new Error(
+      `The bundled native bridge for ${process.platform}-${process.arch} is missing. Reinstall omp-launchpad from npm.`
+    )
+  }
   const cargo = Bun.which("cargo")
   if (!cargo) {
     throw new Error("cargo is not installed. Install Rust 1.88 or newer and ensure cargo is on PATH.")

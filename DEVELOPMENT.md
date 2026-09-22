@@ -54,6 +54,10 @@ selects the command in this order:
 2. The packaged binary matching `process.platform` and `process.arch`
 3. `cargo run --release` from a source checkout
 
+Published npm packages omit the Cargo manifest, lockfile, Rust toolchain pin,
+and Rust sources. Missing native binaries therefore fail as an invalid package
+instead of introducing a runtime Rust dependency.
+
 npm trusted publishing must authorize `goulinkh/omp-launchpad` and workflow
 `release.yml`. Under **Allowed actions**, explicitly enable direct
 `npm publish`; the default staged-publish grant does not authorize this
