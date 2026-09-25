@@ -87,6 +87,6 @@ async fn run_bridge() -> BridgeResponse {
     };
     match launchpad::execute(&request).await {
         Ok(result) => BridgeResponse::success(result),
-        Err(error) => BridgeResponse::failure(error),
+        Err(error) => BridgeResponse::failure_error(&error),
     }
 }

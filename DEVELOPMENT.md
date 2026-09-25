@@ -5,10 +5,13 @@
 - Bun
 - Rust 1.88 or newer
 - OMP 18.1.19 or newer
-- Launchpad credentials for authenticated and private-resource operations
+- Launchpad API credentials for authenticated and write operations; authenticated Git access for private repository files
 
-The pinned toolchain in `rust-toolchain.toml` installs automatically through
-`rustup`. Authenticate from an OMP session when write access is required:
+The pinned toolchain in `rust-toolchain.toml` applies when running from this
+checkout. The Cargo fallback uses OMP's working directory, which may select a
+different toolchain via that project's override; choose a compatible toolchain
+for the OMP session rather than changing the project's override. Authenticate
+from an OMP session when write access is required:
 
 ```text
 /launchpad login
@@ -16,6 +19,11 @@ The pinned toolchain in `rust-toolchain.toml` installs automatically through
 ```
 
 The extension uses the bundled `lpcli` library. A separately installed `lpcli` command can also manage the same credentials.
+
+If `lpcli` is not installed, use `/launchpad login` in OMP or
+`cargo run --release -- login` from this checkout. `file_read` uses anonymous
+Git HTTP, not the API login. A redirect may mean a missing or inaccessible
+repository, file, or branch; private files need an authenticated Git checkout.
 
 Public resources can be tested without credentials by setting:
 
@@ -240,7 +248,7 @@ omp plugin link "$PWD"
 omp plugin list --json
 ```
 
-The list must show `omp-launchpad`, version `0.4.0`, with its path resolving to
+The list must show `omp-launchpad`, version `0.5.2`, with its path resolving to
 this checkout. Start a fresh OMP process and repeat the read-path smoke tests
 without `--no-extensions -e ./index.ts`:
 
@@ -262,7 +270,7 @@ To return to the published plugin after local testing, install the pinned npm
 package:
 
 ```sh
-omp plugin install omp-launchpad@0.5.0
+omp plugin install omp-launchpad@0.5.2
 ```
 
 ## Bridge-only diagnosis

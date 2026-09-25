@@ -28,6 +28,7 @@ interface BridgeSuccess {
 interface BridgeFailure {
   ok: false
   error: string
+  code?: "not_authenticated"
 }
 
 type BridgePayload = BridgeSuccess | BridgeFailure
@@ -47,6 +48,7 @@ export default function launchpadExtension(pi: ExtensionAPI) {
   const status = new LaunchpadStatusController((signal, cwd) =>
     runBridge({ op: "current_merge_proposal" }, signal, cwd)
   )
+  configureInlineStatus(pi)
 
   pi.setLabel("Launchpad")
   pi.registerCommand("launchpad", {
@@ -341,13 +343,11 @@ async function login(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<bo
     throw new Error("/launchpad login requires an interactive OMP session")
   }
 
+  const env = { ...process.env, CARGO_TERM_COLOR: "never" }
   const child = Bun.spawn({
-    cmd: [...bridgeCommand(), "login"],
+    cmd: [...bridgeCommand(ctx.cwd, env), "login"],
     cwd: ctx.cwd,
-    env: {
-      ...process.env,
-      CARGO_TERM_COLOR: "never",
-    },
+    env,
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -415,13 +415,11 @@ async function openBrowser(pi: ExtensionAPI, url: string, cwd: string): Promise<
 }
 
 async function runCommand(command: "logout" | "status", cwd: string): Promise<string> {
+  const env = { ...process.env, CARGO_TERM_COLOR: "never" }
   const child = Bun.spawn({
-    cmd: [...bridgeCommand(), command],
+    cmd: [...bridgeCommand(cwd, env), command],
     cwd,
-    env: {
-      ...process.env,
-      CARGO_TERM_COLOR: "never",
-    },
+    env,
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
@@ -437,6 +435,39 @@ async function runCommand(command: "logout" | "status", cwd: string): Promise<st
   return stdout.trim()
 }
 
+/** Keep the active layout while moving all extension statuses from an extra row into the status bar. */
+function configureInlineStatus(pi: ExtensionAPI): void {
+  const { settings, getPreset } = pi.pi
+  if (!settings.get("statusLine.showHookStatus")) return
+
+  const preset = settings.get("statusLine.preset")
+  const definition = getPreset(preset)
+  const left = preset === "custom" ? settings.get("statusLine.leftSegments") : definition.leftSegments
+  const right = preset === "custom" ? settings.get("statusLine.rightSegments") : definition.rightSegments
+  if (!left.includes("status") && !right.includes("status")) {
+    const gitIndex = left.indexOf("git")
+    const presetOptions: Record<string, unknown> = { ...definition.segmentOptions }
+    const configuredOptions = Object.fromEntries(
+      Object.entries(settings.get("statusLine.segmentOptions")).map(([name, value]) => {
+        const defaults = presetOptions[name]
+        return [
+          name,
+          typeof defaults === "object" && defaults !== null &&
+          typeof value === "object" && value !== null && !Array.isArray(value)
+            ? { ...defaults, ...value }
+            : value,
+        ]
+      })
+    )
+    settings.override("statusLine.preset", "custom")
+    const inlineLeft = [...left]
+    inlineLeft.splice(gitIndex < 0 ? inlineLeft.length : gitIndex + 1, 0, "status")
+    settings.override("statusLine.leftSegments", inlineLeft)
+    settings.override("statusLine.rightSegments", [...right])
+    settings.override("statusLine.segmentOptions", { ...presetOptions, ...configuredOptions })
+  }
+  settings.override("statusLine.showHookStatus", false)
+}
 
 function isLaunchpadUrl(path: unknown): path is string {
   return typeof path === "string" && path.startsWith("lp://")
@@ -453,14 +484,12 @@ async function runBridge(
   signal: AbortSignal | undefined,
   cwd: string
 ): Promise<BridgeSuccess> {
-  const command = bridgeCommand()
+  const env = { ...process.env, CARGO_TERM_COLOR: "never" }
+  const command = bridgeCommand(cwd, env)
   const child = Bun.spawn({
     cmd: command,
     cwd,
-    env: {
-      ...process.env,
-      CARGO_TERM_COLOR: "never",
-    },
+    env,
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -474,7 +503,14 @@ async function runBridge(
     child.exited,
   ])
   if (exitCode !== 0) {
-    throw new Error(stderr.trim() || stdout.trim() || `Rust bridge exited with status ${exitCode}`)
+    const failure = stderr.trim() || stdout.trim() || `Rust bridge exited with status ${exitCode}`
+    const oldCompiler = command.length > 1 && (
+      /^error: rustc \d+\.\d+(?:\.\d+)? is not supported by the following packages?:/m.test(stderr) ||
+      /^error: package .+ cannot be built because it requires rustc \d+\.\d+(?:\.\d+)? or newer, while the currently active rustc version is \d+\.\d+(?:\.\d+)?/m.test(stderr)
+    )
+    throw new Error(oldCompiler
+      ? `${failure}\nCargo selected a Rust compiler too old for this build. Update the toolchain (e.g. rustup update stable) or select a newer compiler for this session; check CARGO_BUILD_RUSTC and Cargo [build] rustc if configured.`
+      : failure)
   }
   let payload: unknown
   try {
@@ -487,14 +523,18 @@ async function runBridge(
     throw new Error("Rust bridge returned an invalid response")
   }
   if (!payload.ok) {
-    throw new Error(payload.error || "Launchpad operation failed")
+    const message = payload.error || "Launchpad operation failed"
+    if (payload.code === "not_authenticated") {
+      throw new Error(`${message}\nRun /launchpad login in an interactive OMP session, or run this command in an interactive terminal${process.platform === "win32" ? " (PowerShell)" : ""}:\n${formatTerminalCommand([...command, "login"], cwd)}`)
+    }
+    throw new Error(message)
   }
   return payload
 }
 
-function bridgeCommand(): string[] {
-  if (process.env.OMP_LAUNCHPAD_BINARY) {
-    return [process.env.OMP_LAUNCHPAD_BINARY]
+function bridgeCommand(cwd: string, env: typeof process.env): string[] {
+  if (env.OMP_LAUNCHPAD_BINARY) {
+    return [env.OMP_LAUNCHPAD_BINARY]
   }
   const packagedBinary = join(
     PLUGIN_DIR,
@@ -504,11 +544,21 @@ function bridgeCommand(): string[] {
   if (existsSync(packagedBinary)) {
     return [packagedBinary]
   }
-  const cargo = Bun.which("cargo")
+  const cargo = Bun.which("cargo", { ...(env.PATH === undefined ? {} : { PATH: env.PATH }), cwd })
   if (!cargo) {
     throw new Error("cargo is not installed. Install Rust 1.88 or newer and ensure cargo is on PATH.")
   }
   return [cargo, "run", "--quiet", "--release", "--manifest-path", MANIFEST_PATH, "--"]
+}
+
+
+function formatTerminalCommand(command: string[], cwd: string): string {
+  if (process.platform === "win32") {
+    const quote = (arg: string) => `'${arg.replaceAll("'", "''")}'`
+    return `Set-Location -LiteralPath ${quote(cwd)}; if ($?) { & ${command.map(quote).join(" ")} }`
+  }
+  const quote = (arg: string) => `'${arg.replaceAll("'", `'"'"'`)}'`
+  return `cd -- ${quote(cwd)} && ${command.map(quote).join(" ")}`
 }
 
 function bridgeResult(payload: BridgeSuccess, changed = false): BridgeToolResult {

@@ -51,6 +51,11 @@ For authenticated or write access, start OMP and complete the authentication flo
 
 *Note:* The extension calls its bundled `lpcli` library directly, so a separate `lpcli` installation is not required. The standalone `lpcli` command remains available for direct use when installed; its authentication commands share the same stored credentials.
 
+If `lpcli` is not installed in your shell, use `/launchpad login` in OMP or
+`cargo run --release -- login` from a source checkout. Missing or rejected API
+credentials print a login hint with an exact terminal command that first selects
+the bridge's working directory. Login requires an interactive terminal and browser.
+
 ## Quick start
 
 Start OMP and refer to a Launchpad resource in your prompt:
@@ -75,6 +80,11 @@ lp://~owner/project/+git/repository/+merge/<id>/diff/<preview-diff-id>
 ```
 
 Bug and merge-proposal views include comments by default. Add `?comments=0` to omit them or `?limit=<n>` to limit them to at most 20. A merge-proposal diff defaults to the current preview diff; select a historical snapshot with the final path segment or `?preview_diff=<id>`. Non-Launchpad paths continue to use OMP's native `read` implementation.
+
+The merge-proposal badge shares OMP's status bar after the Git segment. While
+the extension is loaded, runtime-only layout overrides move all extension
+statuses into that bar instead of extra lines. An explicitly disabled hook
+status (`statusLine.showHookStatus: false`) remains hidden.
 
 ## Tools
 
@@ -125,6 +135,10 @@ proposal targets also accept a numeric ID such as `511601` when the working
 checkout has a related Launchpad remote; use the full Launchpad URL or path
 when no repository context is available.
 
+Merge-proposal creation resolves both repository inputs to their canonical
+Launchpad names before looking up refs. A failed lookup identifies the source
+or target repository or ref that could not be resolved.
+
 `current_merge_proposal` inspects the working directory, current branch, and
 all Git remotes. It prefers a Launchpad `origin`, otherwise the first Launchpad
 remote. `merge_proposal_for_branch` and branch-based
@@ -137,9 +151,20 @@ default repositories for the same Launchpad target. It applies `status` and
 true or the status filter explicitly requests them, and prefers an active
 proposal over a merged proposal. Within that status class it selects the newest
 creation date and ID. `latest: true` instead selects the newest matching
-proposal regardless of status class. Results expose `selected_proposal`,
-`selection_reason`, filters, candidates, and alternatives. Ambiguous and empty
+proposal regardless of status class. Successful matches expose `selected_proposal`,
+`selection_reason`, filters, candidates, and alternatives. Ambiguous
 results report inspected repositories and actionable retry parameters.
+
+An exhaustive branch lookup without a proposal matching its filters returns a
+successful result with `details.found: false` and the repository, branch, and
+filters. Found proposals return `details.found: true`. Repository, permission,
+transport, and incomplete (capped) lookup failures remain errors; do not treat
+them as evidence that no proposal exists. Explicit proposal targets that do
+not exist also remain errors.
+
+For no match, `details.repository` is canonical, `details.requested_repository`
+retains the input, and `details.inspected_repositories` lists related candidates.
+Discussion lookups also honor `format` when no proposal matches.
 
 Discussion `format` accepts `summary`, `structured`, or `both`; `summary` is
 the default. The compact summary reports general-comment and review counts,
@@ -166,6 +191,12 @@ A merge-proposal checkout clones the source branch and adds the target repositor
 
 Inline draft updates and review submissions require an explicit `preview_diff_id`. The bridge re-fetches the merge proposal immediately before each write and rejects a snapshot that is no longer current or is marked stale.
 
+`file_read` fetches through anonymous `git.launchpad.net/plain`, even when API
+credentials are present. A redirect or failed response does not establish that
+the repository is private: check its name, file path, and branch first. Errors
+include that context. API login does not authorize the Git file endpoint;
+private files require an authenticated Git checkout.
+
 ## Configuration
 
 | Variable                    | Effect                                                                                |
@@ -191,6 +222,12 @@ Load the working tree directly in OMP:
 ```sh
 omp --no-extensions -e ./index.ts
 ```
+
+A source checkout without a native binary invokes Cargo from OMP's current
+working directory. Cargo enforces the Rust version required by the bridge and
+its dependencies. If that directory selects an older toolchain, run OMP with
+a compatible `RUSTUP_TOOLCHAIN` (for example `1.88.0`) or use a native binary.
+The extension preserves Cargo's error and adds compiler guidance when applicable.
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for smoke tests, release packaging, plugin linking, and bridge diagnostics.
 

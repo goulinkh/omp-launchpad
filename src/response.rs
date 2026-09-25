@@ -42,6 +42,8 @@ pub enum BridgeResponse {
     Failure {
         ok: bool,
         error: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code: Option<&'static str>,
     },
 }
 
@@ -64,6 +66,15 @@ impl BridgeResponse {
         Self::Failure {
             ok: false,
             error: error.to_string(),
+            code: None,
+        }
+    }
+
+    pub fn failure_error(error: &crate::error::Error) -> Self {
+        Self::Failure {
+            ok: false,
+            error: error.bridge_message(),
+            code: error.code(),
         }
     }
 }

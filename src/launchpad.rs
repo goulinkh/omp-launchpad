@@ -8,7 +8,7 @@ use lpcli::auth;
 use lpcli::client::{Collection, LaunchpadClient, urlenc};
 use lpcli::error::LpError;
 use lpcli::git::{GitRef, list_git_refs};
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Value, json};
 use url::Url;
 
@@ -27,6 +27,12 @@ const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ITEMS: usize = 50;
 const MAX_BRANCH_FALLBACK_ITEMS: usize = 250;
 const MAX_REPOSITORY_CANDIDATES: usize = 100;
+const GIT_PATH_SEGMENT_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~')
+    .remove(b'+');
 
 pub async fn execute(request: &Request) -> Result<OperationResult> {
     request.validate()?;
@@ -436,9 +442,9 @@ async fn view_merge_proposal_for_branch(
     client: &LaunchpadClient,
     request: &Request,
 ) -> Result<OperationResult> {
-    let (requested_repository, branch, inferred) = branch_selector(request).await?;
-    let selection =
-        merge_proposal_for_branch(client, &requested_repository, &branch, request).await?;
+    let (repository_path, branch, inferred, requested_repository) =
+        branch_selector(request).await?;
+    let selection = merge_proposal_for_branch(client, &repository_path, &branch, request).await?;
     proposal_lookup_result(
         client,
         request,
@@ -459,9 +465,10 @@ async fn view_current_merge_proposal(
     request: &Request,
 ) -> Result<OperationResult> {
     let current = local_git::current_repository().await?;
-    let requested_repository = normalise_repository(&current.selected_remote.url)?;
+    let requested_repository = &current.selected_remote.url;
+    let repository_path = normalise_repository(requested_repository)?;
     let selection =
-        merge_proposal_for_branch(client, &requested_repository, &current.branch, request).await?;
+        merge_proposal_for_branch(client, &repository_path, &current.branch, request).await?;
     let context = json!({
         "working_directory": current.working_directory,
         "selected_remote": {
@@ -477,7 +484,7 @@ async fn view_current_merge_proposal(
         request,
         selection,
         ProposalLookupContext {
-            requested_repository: &requested_repository,
+            requested_repository,
             branch: &current.branch,
             inferred: true,
             kind: "current_merge_proposal",
@@ -498,9 +505,31 @@ struct ProposalLookupContext<'value> {
 async fn proposal_lookup_result(
     client: &LaunchpadClient,
     request: &Request,
-    selection: ProposalSelection,
+    selection: ProposalLookup,
     context: ProposalLookupContext<'_>,
 ) -> Result<OperationResult> {
+    let selection = match selection {
+        ProposalLookup::Found(selection) => selection,
+        ProposalLookup::Missing {
+            repository,
+            inspected_repositories,
+        } => {
+            let branch = normalise_ref(context.branch);
+            let text = format!("# No merge proposal found for {repository}:{branch}");
+            let details = json!({
+                "kind": context.kind,
+                "found": false,
+                "repository": repository,
+                "requested_repository": context.requested_repository,
+                "inspected_repositories": inspected_repositories,
+                "branch": branch,
+                "inferred": context.inferred,
+                "selection_filters": proposal_selection_filters(request),
+                "context": context.metadata,
+            });
+            return Ok(OperationResult::new(text).with_details(details));
+        }
+    };
     let canonical_repository = render::text_field(&selection.repository, "unique_name")
         .unwrap_or(repository_identifier(&selection.repository));
     let source_url = render::text_field(&selection.proposal, "web_link").map(str::to_owned);
@@ -522,6 +551,7 @@ async fn proposal_lookup_result(
     let selected_proposal = proposal_details(client, &selection.proposal).await?;
     let details = json!({
         "kind": context.kind,
+        "found": true,
         "repository": canonical_repository,
         "requested_repository": context.requested_repository,
         "branch": normalise_ref(context.branch),
@@ -556,13 +586,37 @@ async fn view_merge_proposal_discussion(
             "selected the explicitly requested merge proposal".to_owned(),
         )
     } else {
-        let (requested_repository, branch, inferred) = branch_selector(request).await?;
+        let (repository_path, branch, inferred, requested_repository) =
+            branch_selector(request).await?;
         let selection =
-            merge_proposal_for_branch(client, &requested_repository, &branch, request).await?;
+            merge_proposal_for_branch(client, &repository_path, &branch, request).await?;
+        let selection = match selection {
+            ProposalLookup::Found(selection) => selection,
+            missing @ ProposalLookup::Missing { .. } => {
+                let result = proposal_lookup_result(
+                    client,
+                    request,
+                    missing,
+                    ProposalLookupContext {
+                        requested_repository: &requested_repository,
+                        branch: &branch,
+                        inferred,
+                        kind: "merge_proposal_discussion",
+                        metadata: None,
+                    },
+                )
+                .await?;
+                return Ok(format_discussion_result(
+                    result,
+                    request.format.unwrap_or_default(),
+                ));
+            }
+        };
         let canonical_repository = render::text_field(&selection.repository, "unique_name")
             .unwrap_or(repository_identifier(&selection.repository));
         let lookup = json!({
             "repository": canonical_repository,
+            "found": true,
             "requested_repository": requested_repository,
             "branch": normalise_ref(&branch),
             "inferred": inferred,
@@ -795,6 +849,7 @@ async fn view_merge_proposal_discussion(
     let format = request.format.unwrap_or_default();
     let details = json!({
         "kind": "merge_proposal_discussion",
+        "found": true,
         "selected_proposal": proposal_details(client, &proposal).await?,
         "selection_reason": selection_reason,
         "lookup": lookup,
@@ -817,16 +872,31 @@ async fn view_merge_proposal_discussion(
         "inline_threads": inline_threads,
         "preview_diffs": preview_diff_summaries,
     });
-    let text = match format {
-        DiscussionFormat::Summary => markdown,
-        DiscussionFormat::Structured => details.to_string(),
-        DiscussionFormat::Both => {
-            format!("{markdown}\n\n## Structured data\n\n```json\n{details}\n```")
-        }
+    Ok(format_discussion_result(
+        OperationResult::new(markdown)
+            .with_source_url(source_url)
+            .with_details(details),
+        format,
+    ))
+}
+
+fn format_discussion_result(
+    mut result: OperationResult,
+    format: DiscussionFormat,
+) -> OperationResult {
+    if format == DiscussionFormat::Summary {
+        return result;
+    }
+    let details = Value::Object(std::mem::take(&mut result.details));
+    result.text = if format == DiscussionFormat::Structured {
+        details.to_string()
+    } else {
+        format!(
+            "{}\n\n## Structured data\n\n```json\n{details}\n```",
+            result.text
+        )
     };
-    Ok(OperationResult::new(text)
-        .with_source_url(source_url)
-        .with_details(details))
+    result.with_details(details)
 }
 
 struct ProposalSelection {
@@ -838,7 +908,7 @@ struct ProposalSelection {
     candidate_count: usize,
 }
 
-async fn branch_selector(request: &Request) -> Result<(String, String, bool)> {
+async fn branch_selector(request: &Request) -> Result<(String, String, bool, String)> {
     if let (Some(repository), Some(branch)) = (
         request
             .repository
@@ -853,10 +923,19 @@ async fn branch_selector(request: &Request) -> Result<(String, String, bool)> {
             normalise_repository(repository)?,
             branch.trim().to_owned(),
             false,
+            repository.to_owned(),
         ));
     }
     let (repository, branch) = local_git::current_repository_branch().await?;
-    Ok((normalise_repository(&repository)?, branch, true))
+    Ok((normalise_repository(&repository)?, branch, true, repository))
+}
+
+enum ProposalLookup {
+    Found(ProposalSelection),
+    Missing {
+        repository: String,
+        inspected_repositories: Vec<String>,
+    },
 }
 
 async fn merge_proposal_for_branch(
@@ -864,8 +943,15 @@ async fn merge_proposal_for_branch(
     repository_path: &str,
     branch: &str,
     request: &Request,
-) -> Result<ProposalSelection> {
-    let repository = get_repository(client, repository_path).await?;
+) -> Result<ProposalLookup> {
+    let repository = get_repository(client, repository_path)
+        .await
+        .map_err(|source| {
+            Error::context(
+                format!("cannot look up repository {repository_path} for branch {branch}"),
+                source,
+            )
+        })?;
     let branch = normalise_ref(branch);
     let (proposals, requested_fallback_capped) =
         repository_branch_proposals(client, &repository, &branch).await?;
@@ -873,14 +959,14 @@ async fn merge_proposal_for_branch(
     let eligible = eligible_proposals(proposals, request);
     if !eligible.is_empty() {
         let (proposal, alternatives, reason) = select_proposal(eligible, request)?;
-        return Ok(ProposalSelection {
+        return Ok(ProposalLookup::Found(ProposalSelection {
             repository,
             proposal,
             alternatives,
             related_repository: false,
             reason,
             candidate_count: requested_candidate_count,
-        });
+        }));
     }
 
     let target_link = render::text_field(&repository, "target_link")
@@ -908,27 +994,37 @@ async fn merge_proposal_for_branch(
                 if render::text_field(&related_repository, "unique_name")
                     == Some(canonical_repository)
                 {
-                    return None;
+                    return Ok(None);
                 }
-                match related_repository_branch_proposals(client, &related_repository, branch).await
-                {
-                    Ok(proposals) => {
-                        let candidate_count = proposals.len();
-                        let proposals = eligible_proposals(proposals, request);
-                        (!proposals.is_empty()).then_some((
-                            related_repository,
-                            proposals,
-                            candidate_count,
-                        ))
-                    }
-                    Err(_) => None,
-                }
+                let proposals =
+                    related_repository_branch_proposals(client, &related_repository, branch)
+                        .await
+                        .map_err(|error| {
+                            Error::context(
+                                format!(
+                                    "cannot inspect related repository {} for {branch}",
+                                    repository_identifier(&related_repository)
+                                ),
+                                error,
+                            )
+                        })?;
+                let candidate_count = proposals.len();
+                let proposals = eligible_proposals(proposals, request);
+                Ok((!proposals.is_empty()).then_some((
+                    related_repository,
+                    proposals,
+                    candidate_count,
+                )))
             }
         })
         .buffer_unordered(8)
-        .filter_map(|candidate| async move { candidate })
-        .collect::<Vec<_>>()
-        .await;
+        .collect::<Vec<Result<Option<(Value, Vec<Value>, usize)>>>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
 
     if matches.len() > 1 {
         let candidates = matches
@@ -950,39 +1046,45 @@ async fn merge_proposal_for_branch(
         )));
     }
     let Some((repository, proposals, candidate_count)) = matches.pop() else {
-        let requested_cap = if requested_fallback_capped {
-            format!(
-                "; requested repository search was limited to its newest {MAX_BRANCH_FALLBACK_ITEMS} proposals"
-            )
-        } else {
-            String::new()
-        };
-        let related_cap = if truncated {
-            format!(
-                "; related lookup was limited to the first {MAX_REPOSITORY_CANDIDATES} likely repositories"
-            )
-        } else {
-            String::new()
-        };
-        let inspected = if inspected_repositories.is_empty() {
-            "none".to_owned()
-        } else {
-            inspected_repositories.join(", ")
-        };
-        return Err(Error::invalid(format!(
-            "cannot resolve a merge proposal for {canonical_repository}:{branch}; inspected repositories: {canonical_repository}, {inspected}; filters: {}; accepted syntax: repository plus branch, merge proposal ID from a Launchpad checkout, or lp://~owner/project/+git/repository/+merge/ID; retry with status, target_branch, include_superseded=true, or a full target{requested_cap}{related_cap}",
-            proposal_selection_filter_text(request)
-        )));
+        if requested_fallback_capped || truncated {
+            let requested_cap = if requested_fallback_capped {
+                format!(
+                    "; requested repository search was limited to its newest {MAX_BRANCH_FALLBACK_ITEMS} proposals"
+                )
+            } else {
+                String::new()
+            };
+            let related_cap = if truncated {
+                format!(
+                    "; related lookup was limited to the first {MAX_REPOSITORY_CANDIDATES} likely repositories"
+                )
+            } else {
+                String::new()
+            };
+            let inspected = if inspected_repositories.is_empty() {
+                "none".to_owned()
+            } else {
+                inspected_repositories.join(", ")
+            };
+            return Err(Error::invalid(format!(
+                "cannot establish whether a merge proposal exists for {canonical_repository}:{branch}; inspected repositories: {canonical_repository}, {inspected}; filters: {}; retry with a full merge proposal target or narrow the search{requested_cap}{related_cap}",
+                proposal_selection_filter_text(request)
+            )));
+        }
+        return Ok(ProposalLookup::Missing {
+            repository: canonical_repository.to_owned(),
+            inspected_repositories,
+        });
     };
     let (proposal, alternatives, reason) = select_proposal(proposals, request)?;
-    Ok(ProposalSelection {
+    Ok(ProposalLookup::Found(ProposalSelection {
         repository,
         proposal,
         alternatives,
         related_repository: true,
         reason,
         candidate_count: requested_candidate_count + candidate_count,
-    })
+    }))
 }
 
 async fn repository_branch_proposals(
@@ -1011,12 +1113,15 @@ async fn repository_branch_proposals(
             .ok_or_else(|| Error::invalid("Launchpad repository has no merge proposal collection"))?
             .to_owned()
     };
-    let entries = if ref_exists {
+    let mut entries = if ref_exists {
         fetch_all_entries(client, &collection_url).await?
     } else {
-        fetch_entries(client, &collection_url, MAX_BRANCH_FALLBACK_ITEMS).await?
+        fetch_entries(client, &collection_url, MAX_BRANCH_FALLBACK_ITEMS + 1).await?
     };
-    let fallback_was_capped = !ref_exists && entries.len() == MAX_BRANCH_FALLBACK_ITEMS;
+    let fallback_was_capped = !ref_exists && entries.len() > MAX_BRANCH_FALLBACK_ITEMS;
+    if fallback_was_capped {
+        entries.truncate(MAX_BRANCH_FALLBACK_ITEMS);
+    }
     let proposals = entries
         .into_iter()
         .filter(|proposal| render::text_field(proposal, "source_git_path") == Some(branch))
@@ -1039,7 +1144,14 @@ async fn related_repository_branch_proposals(
         .query_pairs_mut()
         .append_pair("ws.op", "getRefByPath")
         .append_pair("path", branch);
-    let git_ref: Value = client.get_url(ref_url.as_str()).await?;
+    let git_ref: Value = match client.get_url(ref_url.as_str()).await {
+        Ok(git_ref) => git_ref,
+        Err(LpError::NotFound(_)) => return Ok(Vec::new()),
+        Err(source) => return Err(source.into()),
+    };
+    if git_ref.is_null() {
+        return Ok(Vec::new());
+    }
     let ref_url = render::text_field(&git_ref, "self_link")
         .ok_or_else(|| Error::invalid("Launchpad Git reference has no API link"))?;
     let proposals = fetch_all_entries(
@@ -1480,16 +1592,20 @@ async fn create_merge_proposal(
         .unwrap_or_else(|| source_repository.clone());
     let source_ref = request.string(&request.source_ref, "source_ref")?;
     let target_ref = request.string(&request.target_ref, "target_ref")?;
-    let source = find_git_ref(client, &source_repository, source_ref).await?;
-    let target = find_git_ref(client, &target_repository, target_ref).await?;
-    let source_link = source
-        .self_link
-        .as_deref()
-        .ok_or_else(|| Error::invalid("source ref has no API link"))?;
-    let target_link = target
-        .self_link
-        .as_deref()
-        .ok_or_else(|| Error::invalid("target ref has no API link"))?;
+    let source = find_git_ref(client, "source", &source_repository, source_ref).await?;
+    let target = find_git_ref(client, "target", &target_repository, target_ref).await?;
+    let source_link = source.self_link.as_deref().ok_or_else(|| {
+        Error::invalid(format!(
+            "source ref {} in repository {source_repository} has no API link",
+            normalise_ref(source_ref)
+        ))
+    })?;
+    let target_link = target.self_link.as_deref().ok_or_else(|| {
+        Error::invalid(format!(
+            "target ref {} in repository {target_repository} has no API link",
+            normalise_ref(target_ref)
+        ))
+    })?;
     let needs_review = request.needs_review.unwrap_or(true).to_string();
     let mut parameters = vec![
         ("ws.op", "createMergeProposal"),
@@ -1505,8 +1621,18 @@ async fn create_merge_proposal(
     }
     let location = client
         .post_pairs_url_created_location(source_link, &parameters)
-        .await?;
-    let proposal: Value = client.get_url(&location).await?;
+        .await
+        .map_err(|source| Error::context(format!(
+            "cannot create merge proposal from source {source_repository}:{} to target {target_repository}:{}",
+            normalise_ref(source_ref), normalise_ref(target_ref)
+        ), source.into()))?;
+    let proposal: Value = client.get_url(&location).await.map_err(|source| Error::context(
+        format!(
+            "cannot load merge proposal created from source {source_repository}:{} to target {target_repository}:{}",
+            normalise_ref(source_ref), normalise_ref(target_ref)
+        ),
+        source.into(),
+    ))?;
     let text = format!(
         "# Created Launchpad merge proposal\n\n{}",
         render::render_proposal(&proposal, &[], &[], false, 1)
@@ -1698,55 +1824,137 @@ async fn read_repository_file(request: &Request) -> Result<OperationResult> {
     let repository = normalise_repository(request.repository()?)?;
     let repository = repository.trim_matches('/');
     let path = request.path("path")?.trim();
-    let repository = encode_path(repository);
-    let path = encode_path(path);
+    let branch = request.branch.as_deref().unwrap_or("(default)");
+    let context =
+        format!("cannot read Launchpad repository file {repository}:{path} at branch {branch}");
+    let encoded_repository = encode_path(repository);
+    let encoded_path = encode_path(path);
     let mut url = Url::parse(&format!(
-        "https://git.launchpad.net/{repository}/plain/{path}"
+        "https://git.launchpad.net/{encoded_repository}/plain/{encoded_path}"
     ))
     .map_err(|source| Error::Url {
-        url: format!("https://git.launchpad.net/{repository}/plain/{path}"),
+        url: format!("https://git.launchpad.net/{encoded_repository}/plain/{encoded_path}"),
         source,
     })?;
     if let Some(branch) = request.branch.as_deref() {
         url.query_pairs_mut().append_pair("h", branch);
     }
-    let response = reqwest::Client::new()
-        .get(url.clone())
-        .send()
-        .await
-        .map_err(|source| Error::Web {
-            url: url.to_string(),
-            source,
-        })?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(Error::HttpStatus {
-            url: url.to_string(),
-            status,
-        });
-    }
-    let bytes = response.bytes().await.map_err(|source| Error::Web {
-        url: url.to_string(),
-        source,
-    })?;
-    if bytes.len() > MAX_FILE_BYTES {
-        return Err(Error::invalid(format!(
-            "Launchpad file is larger than {MAX_FILE_BYTES} bytes"
-        )));
-    }
-    let byte_count = bytes.len();
-    let text =
-        String::from_utf8(bytes.to_vec()).map_err(|source| Error::OutputEncoding { source })?;
+    let text = fetch_git_plain_file(&url, &context).await?;
     let details = json!({
         "kind": "file",
         "repository": request.repository()?,
         "path": request.path("path")?,
         "branch": request.branch,
-        "bytes": byte_count,
+        "bytes": text.len(),
     });
     Ok(OperationResult::new(text)
         .with_source_url(Some(url.to_string()))
         .with_details(details))
+}
+
+async fn fetch_git_plain_file(url: &Url, context: &str) -> Result<String> {
+    const FILE_TRANSPORT_GUIDANCE: &str = "git.launchpad.net/plain uses anonymous Git HTTP, not Launchpad API login; check repository, path and ref or use an authenticated Git checkout";
+
+    let response = reqwest::Client::new()
+        .get(url.clone())
+        .send()
+        .await
+        .map_err(|source| {
+            Error::context(
+                context,
+                Error::Web {
+                    url: url.to_string(),
+                    source,
+                },
+            )
+        })?;
+    if response.url().scheme() != url.scheme()
+        || response.url().host_str() != url.host_str()
+        || !response.url().path().contains("/plain/")
+    {
+        let host = response.url().host_str().unwrap_or("unknown host");
+        return Err(Error::context(
+            context,
+            Error::GitFileResponse {
+                reason: format!(
+                    "redirected to {host} outside a Git plain-file URL; {FILE_TRANSPORT_GUIDANCE}"
+                ),
+            },
+        ));
+    }
+    let status = response.status();
+    if !status.is_success() {
+        let guidance = if status == reqwest::StatusCode::UNAUTHORIZED
+            || status == reqwest::StatusCode::FORBIDDEN
+        {
+            format!("; {FILE_TRANSPORT_GUIDANCE}")
+        } else {
+            String::new()
+        };
+        return Err(Error::context(
+            context,
+            Error::GitFileResponse {
+                reason: format!("git.launchpad.net returned HTTP {status}{guidance}"),
+            },
+        ));
+    }
+    let html_response = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|content_type| {
+            content_type.trim().eq_ignore_ascii_case("text/html")
+                || content_type
+                    .trim()
+                    .eq_ignore_ascii_case("application/xhtml+xml")
+        });
+    if html_response {
+        return Err(Error::context(
+            context,
+            Error::GitFileResponse {
+                reason: format!(
+                    "git.launchpad.net returned an HTML page instead of file content; {FILE_TRANSPORT_GUIDANCE}"
+                ),
+            },
+        ));
+    }
+    let bytes = response.bytes().await.map_err(|source| {
+        Error::context(
+            context,
+            Error::Web {
+                url: url.to_string(),
+                source,
+            },
+        )
+    })?;
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err(Error::context(
+            context,
+            Error::GitFileResponse {
+                reason: format!("Launchpad file is larger than {MAX_FILE_BYTES} bytes"),
+            },
+        ));
+    }
+    let text = String::from_utf8(bytes.to_vec()).map_err(|_| {
+        Error::context(
+            context,
+            Error::GitFileResponse {
+                reason: "file response is not UTF-8 text".to_owned(),
+            },
+        )
+    })?;
+    if text.trim() == "Invalid OpenID transaction" {
+        return Err(Error::context(
+            context,
+            Error::GitFileResponse {
+                reason: format!(
+                    "git.launchpad.net returned an OpenID error instead of file content; {FILE_TRANSPORT_GUIDANCE}"
+                ),
+            },
+        ));
+    }
+    Ok(text)
 }
 
 async fn request_merge_proposal(
@@ -2140,17 +2348,39 @@ async fn get_merge_proposal(client: &LaunchpadClient, repository: &str, id: u64)
 
 async fn find_git_ref(
     client: &LaunchpadClient,
+    role: &str,
     repository: &str,
     requested_path: &str,
 ) -> Result<GitRef> {
     let requested_path = normalise_ref(requested_path);
-    list_git_refs(client, repository)
-        .await?
+    let context = format!("cannot resolve {role} ref {requested_path} in repository {repository}");
+    let resource = get_repository(client, repository).await.map_err(|source| {
+        Error::context(
+            format!("cannot resolve {role} repository {repository} for ref {requested_path}"),
+            source,
+        )
+    })?;
+    let canonical_repository = render::text_field(&resource, "unique_name")
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| {
+            Error::invalid(format!(
+                "{context}; Launchpad repository has no unique name"
+            ))
+        })?;
+    let git_refs = list_git_refs(client, canonical_repository)
+        .await
+        .map_err(|source| {
+            Error::context(
+                format!("{context} (canonical repository {canonical_repository})"),
+                source.into(),
+            )
+        })?;
+    git_refs
         .into_iter()
         .find(|git_ref| git_ref.path.as_deref() == Some(requested_path.as_str()))
         .ok_or_else(|| {
             Error::invalid(format!(
-                "ref {requested_path} was not found in {repository}"
+                "{context} (canonical repository {canonical_repository}); ref was not found"
             ))
         })
 }
@@ -2242,7 +2472,7 @@ fn launchpad_web_url(path: &str, kind: &str) -> String {
 
 fn encode_path(path: &str) -> String {
     path.split('/')
-        .map(|segment| utf8_percent_encode(segment, NON_ALPHANUMERIC).to_string())
+        .map(|segment| utf8_percent_encode(segment, GIT_PATH_SEGMENT_ENCODE_SET).to_string())
         .collect::<Vec<_>>()
         .join("/")
 }
@@ -2260,13 +2490,359 @@ mod tests {
     use std::collections::HashMap;
 
     use chrono::DateTime;
-    use serde_json::json;
+    use lpcli::client::LaunchpadClient;
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use url::Url;
 
     use super::{
-        eligible_proposals, matches_discussion_filters, normalise_inline_comment,
-        select_preview_diff, select_proposal, thread_state, validate_current_preview_diff,
+        ProposalLookup, ProposalLookupContext, eligible_proposals, encode_path,
+        fetch_git_plain_file, find_git_ref, format_discussion_result, matches_discussion_filters,
+        normalise_inline_comment, proposal_lookup_result, related_repository_branch_proposals,
+        repository_branch_proposals, select_preview_diff, select_proposal, thread_state,
+        validate_current_preview_diff, view_merge_proposal_for_branch,
     };
-    use crate::request::{Request, ResourceTarget};
+    use crate::request::{DiscussionFormat, Request, ResourceTarget};
+
+    async fn read_request_headers(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0; 512];
+            let size = stream.read(&mut chunk).await.unwrap();
+            assert!(size > 0, "client closed before completing request headers");
+            request.extend_from_slice(&chunk[..size]);
+            if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                return String::from_utf8(request).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_web_login_responses_without_rejecting_source_text() {
+        let cases = [
+            (
+                "Text/Html; charset=utf-8",
+                "<html>Invalid OpenID transaction</html>",
+                Some("HTML"),
+            ),
+            ("text/plain", "Invalid OpenID transaction", Some("OpenID")),
+            ("text/plain", "Example: Invalid OpenID transaction", None),
+        ];
+        for (content_type, body, expected_error) in cases {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_request_headers(&mut stream).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+            let url = Url::parse(&format!("http://{address}/repo/plain/README?h=main")).unwrap();
+            let result = fetch_git_plain_file(
+                &url,
+                "cannot read Launchpad repository file repo:README at branch main",
+            )
+            .await;
+            server.await.unwrap();
+            if let Some(expected_error) = expected_error {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("repo:README at branch main"));
+                assert!(error.contains(expected_error));
+            } else {
+                assert_eq!(result.unwrap(), body);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn redirected_plain_file_reports_anonymous_access_without_assuming_privacy() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request_headers(&mut stream).await;
+            let redirect = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{address}/login\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(redirect.as_bytes()).await.unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request_headers(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 5\r\nConnection: close\r\n\r\nlogin")
+                .await
+                .unwrap();
+        });
+        let url = Url::parse(&format!("http://{address}/repo/plain/package.json")).unwrap();
+        let error = fetch_git_plain_file(&url, "cannot read repo:package.json")
+            .await
+            .unwrap_err()
+            .to_string();
+        server.await.unwrap();
+        assert!(error.contains("redirected"));
+        assert!(error.contains("anonymous Git HTTP"));
+        assert!(!error.contains("private"));
+    }
+
+    #[test]
+    fn git_plain_paths_preserve_repository_names_and_escape_unsafe_bytes() {
+        let public = Url::parse(&format!(
+            "https://git.launchpad.net/{}/plain/{}",
+            encode_path("launchpad-ui"),
+            encode_path("package.json")
+        ))
+        .unwrap();
+        assert_eq!(public.path(), "/launchpad-ui/plain/package.json");
+        let canonical = Url::parse(&format!(
+            "https://git.launchpad.net/{}/plain/src/main.rs",
+            encode_path("~owner/my-project/+git/my.repo")
+        ))
+        .unwrap();
+        assert_eq!(
+            canonical.path(),
+            "/~owner/my-project/+git/my.repo/plain/src/main.rs"
+        );
+        assert_eq!(encode_path("a b/c?#.txt"), "a%20b/c%3F%23.txt");
+    }
+
+    #[tokio::test]
+    async fn missing_discussion_respects_structured_and_both_formats() {
+        let client = LaunchpadClient::new(None);
+        let request: Request = serde_json::from_str(
+            r#"{"op":"merge_proposal_discussion","repository":"launchpad-ui","branch":"missing"}"#,
+        )
+        .unwrap();
+        for format in [DiscussionFormat::Structured, DiscussionFormat::Both] {
+            let lookup = proposal_lookup_result(
+                &client,
+                &request,
+                ProposalLookup::Missing {
+                    repository: "~owner/launchpad-ui/+git/launchpad-ui".to_owned(),
+                    inspected_repositories: vec![
+                        "~other/launchpad-ui/+git/launchpad-ui".to_owned(),
+                    ],
+                },
+                ProposalLookupContext {
+                    requested_repository: "launchpad-ui",
+                    branch: "missing",
+                    inferred: false,
+                    kind: "merge_proposal_discussion",
+                    metadata: None,
+                },
+            )
+            .await
+            .unwrap();
+            let result = format_discussion_result(lookup, format);
+            let details = Value::Object(result.details);
+            assert_eq!(details["found"], false);
+            assert_eq!(
+                details["repository"],
+                "~owner/launchpad-ui/+git/launchpad-ui"
+            );
+            assert_eq!(details["requested_repository"], "launchpad-ui");
+            assert_eq!(
+                details["inspected_repositories"],
+                json!(["~other/launchpad-ui/+git/launchpad-ui"])
+            );
+            if format == DiscussionFormat::Structured {
+                assert_eq!(
+                    serde_json::from_str::<Value>(&result.text).unwrap(),
+                    details
+                );
+            } else {
+                assert!(result.text.starts_with("# No merge proposal found"));
+                let (_, json_block) = result.text.split_once("```json\n").unwrap();
+                let (json_block, _) = json_block.split_once("\n```").unwrap();
+                assert_eq!(serde_json::from_str::<Value>(json_block).unwrap(), details);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_branch_lookup_reports_canonical_and_inspected_repositories() {
+        let canonical = "~owner/launchpad-ui/+git/launchpad-ui";
+        let related = "~other/launchpad-ui/+git/launchpad-ui";
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let refs_path = format!("/devel/{canonical}/refs");
+        let related_ref_path = format!("/devel/{related}?ws.op=getRefByPath&");
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request_headers(&mut stream).await;
+                let path = request.split_ascii_whitespace().nth(1).unwrap_or_default();
+                let body = if path == "/devel/+git?ws.op=getByPath&path=launchpad-ui" {
+                    json!({
+                        "unique_name": canonical,
+                        "name": "launchpad-ui",
+                        "target_link": format!("http://{address}/devel/launchpad-ui"),
+                        "landing_targets_collection_link": format!("http://{address}/landing_targets"),
+                    })
+                } else if path == refs_path || path == "/landing_targets" {
+                    json!({ "entries": [], "next_collection_link": null })
+                } else if path.starts_with("/devel/+git?ws.op=getRepositories&") {
+                    json!({
+                        "entries": [{
+                            "unique_name": related,
+                            "name": "launchpad-ui",
+                            "self_link": format!("http://{address}/devel/{related}"),
+                        }],
+                        "next_collection_link": null,
+                    })
+                } else if path.starts_with(&related_ref_path) {
+                    Value::Null
+                } else {
+                    panic!("unexpected request: {path}");
+                }
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client = LaunchpadClient::new(None).with_base_url(format!("http://{address}/devel"));
+        let request: Request = serde_json::from_str(
+            r#"{"op":"merge_proposal_for_branch","repository":"lp:launchpad-ui","branch":"missing"}"#,
+        )
+        .unwrap();
+        let result = view_merge_proposal_for_branch(&client, &request).await;
+        server.abort();
+        let details = result.unwrap().details;
+        assert_eq!(details["found"], false);
+        assert_eq!(details["repository"], canonical);
+        assert_eq!(details["requested_repository"], "lp:launchpad-ui");
+        assert_eq!(details["inspected_repositories"], json!([related]));
+    }
+
+    #[tokio::test]
+    async fn fallback_only_caps_when_more_than_250_proposals_exist() {
+        let canonical = "~owner/project/+git/repo";
+        for count in [250, 251] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let request = read_request_headers(&mut stream).await;
+                    let path = request.split_ascii_whitespace().nth(1).unwrap_or_default();
+                    let body = if path == format!("/devel/{canonical}/refs") {
+                        json!({ "entries": [], "next_collection_link": null }).to_string()
+                    } else if path == "/landing_targets" {
+                        let entries = (0..count)
+                            .map(|index| {
+                                json!({
+                                    "source_git_path": if index == 250 {
+                                        "refs/heads/feature"
+                                    } else {
+                                        "refs/heads/other"
+                                    },
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        json!({ "entries": entries, "next_collection_link": null }).to_string()
+                    } else {
+                        panic!("unexpected request: {path}");
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            let client =
+                LaunchpadClient::new(None).with_base_url(format!("http://{address}/devel"));
+            let repository = json!({
+                "unique_name": canonical,
+                "landing_targets_collection_link": format!("http://{address}/landing_targets"),
+            });
+            let lookup =
+                repository_branch_proposals(&client, &repository, "refs/heads/feature").await;
+            server.abort();
+            let (matches, capped) = lookup.unwrap();
+            assert!(matches.is_empty());
+            assert_eq!(capped, count > 250);
+        }
+    }
+
+    #[tokio::test]
+    async fn resolves_git_ssh_alias_refs_through_canonical_repository() {
+        let canonical = "~launchpad-committers/mobot/+git/mobot";
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let refs_path = format!("/devel/{canonical}/refs");
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request_headers(&mut stream).await;
+                let path = request.split_ascii_whitespace().nth(1).unwrap_or_default();
+                let (status, body) = if path == "/devel/+git?ws.op=getByPath&path=mobot" {
+                    ("200 OK", json!({ "unique_name": canonical }).to_string())
+                } else if path == refs_path {
+                    (
+                        "200 OK",
+                        json!({
+                            "entries": [{
+                                "path": "refs/heads/feature",
+                                "self_link": format!("http://{address}/devel/{canonical}/+ref/feature"),
+                            }],
+                            "next_collection_link": null,
+                        }).to_string(),
+                    )
+                } else {
+                    ("404 Not Found", "{}".to_owned())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client = LaunchpadClient::new(None).with_base_url(format!("http://{address}/devel"));
+        let result = find_git_ref(
+            &client,
+            "source",
+            "git+ssh://goulinkh@git.launchpad.net/mobot",
+            "feature",
+        )
+        .await;
+        server.abort();
+        let git_ref = result.unwrap();
+        assert_eq!(git_ref.path.as_deref(), Some("refs/heads/feature"));
+        assert_eq!(
+            git_ref.self_link.as_deref(),
+            Some(format!("http://{address}/devel/{canonical}/+ref/feature").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_related_git_ref_returns_no_proposals() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request_headers(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnull")
+                .await
+                .unwrap();
+        });
+        let client = LaunchpadClient::new(None).with_base_url(format!("http://{address}/devel"));
+        let repository = json!({
+            "self_link": format!("http://{address}/devel/~owner/project/+git/repo"),
+        });
+        let result =
+            related_repository_branch_proposals(&client, &repository, "refs/heads/never-created")
+                .await;
+        server.await.unwrap();
+        assert!(result.unwrap().is_empty());
+    }
 
     #[test]
     fn selects_preview_diff_for_numeric_merge_proposal() {
