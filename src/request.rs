@@ -37,6 +37,7 @@ pub enum Operation {
     DiffLineMap,
     BugCreate,
     MergeProposalCreate,
+    ReplaceMergeProposalPrerequisite,
     Comment,
     ReviewDraftUpdate,
     ReviewSubmit,
@@ -52,6 +53,7 @@ impl Operation {
             Self::ReviewDrafts
                 | Self::BugCreate
                 | Self::MergeProposalCreate
+                | Self::ReplaceMergeProposalPrerequisite
                 | Self::Comment
                 | Self::ReviewDraftUpdate
                 | Self::ReviewSubmit
@@ -151,6 +153,7 @@ pub struct Request {
     pub information_type: Option<String>,
     pub source_ref: Option<String>,
     pub target_ref: Option<String>,
+    pub merge_prerequisite: Option<String>,
     pub commit_message: Option<String>,
     pub needs_review: Option<bool>,
     pub body: Option<String>,
@@ -187,6 +190,10 @@ impl Request {
                 ("repository", &self.repository),
                 ("source_ref", &self.source_ref),
                 ("target_ref", &self.target_ref),
+            ],
+            Operation::ReplaceMergeProposalPrerequisite => &[
+                ("target", &self.target),
+                ("merge_prerequisite", &self.merge_prerequisite),
             ],
             Operation::Comment => &[("target", &self.target), ("body", &self.body)],
             Operation::SetMergeProposalStatus => &[("target", &self.target)],
@@ -232,6 +239,19 @@ impl Request {
             self.file_line()?;
             self.side()?;
             validate_repository_path(self.path("path")?)?;
+        }
+        if let Some(prerequisite) = self.merge_prerequisite.as_deref() {
+            if !matches!(
+                self.op,
+                Operation::MergeProposalCreate | Operation::ReplaceMergeProposalPrerequisite
+            ) {
+                return Err(Error::invalid(
+                    "merge_prerequisite is supported only for proposal creation or replacement",
+                ));
+            }
+            if prerequisite.trim().is_empty() {
+                return Err(Error::invalid("merge_prerequisite cannot be empty"));
+            }
         }
         if self.op == Operation::SetMergeProposalStatus {
             self.status()?;

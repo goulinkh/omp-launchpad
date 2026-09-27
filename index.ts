@@ -263,7 +263,7 @@ export default function launchpadExtension(pi: ExtensionAPI) {
     name: "launchpad_write",
     label: "Launchpad Write",
     description:
-      "Mutate Launchpad or local Git state: create bugs or merge proposals, add comments, update inline review " +
+      "Mutate Launchpad or local Git state: create or replace merge proposals, create bugs, add comments, update inline review " +
       "drafts, submit reviews, change proposal status, check out a proposal, or push its checked-out branch.",
     parameters: z.union([
       z.object({
@@ -281,6 +281,7 @@ export default function launchpadExtension(pi: ExtensionAPI) {
         target_repository: z.string().optional(),
         source_ref: z.string(),
         target_ref: z.string(),
+        merge_prerequisite: z.string().optional(),
         description: z.string().optional(),
         commit_message: z.string().optional(),
         needs_review: z.boolean().optional(),
@@ -310,6 +311,12 @@ export default function launchpadExtension(pi: ExtensionAPI) {
         preview_diff_id: positiveInteger,
         body: z.string().optional(),
         vote: reviewVote.optional(),
+        ...withIntent,
+      }),
+      z.object({
+        op: z.literal("replace_merge_proposal_prerequisite"),
+        target: mergeProposalTarget,
+        merge_prerequisite: z.string(),
         ...withIntent,
       }),
       z.object({

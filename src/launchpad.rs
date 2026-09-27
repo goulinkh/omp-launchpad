@@ -60,6 +60,9 @@ pub async fn execute(request: &Request) -> Result<OperationResult> {
         Operation::DiffLineMap => map_diff_line(&client, request).await,
         Operation::BugCreate => create_bug(&client, request).await,
         Operation::MergeProposalCreate => create_merge_proposal(&client, request).await,
+        Operation::ReplaceMergeProposalPrerequisite => {
+            replace_merge_proposal_prerequisite(&client, request).await
+        }
         Operation::Comment => add_comment(&client, request).await,
         Operation::ReviewDraftUpdate => update_review_draft(&client, request).await,
         Operation::ReviewSubmit => submit_review(&client, request).await,
@@ -247,6 +250,8 @@ async fn view_merge_proposal_value(
             "preview_diff_id": preview_diff_id,
             "stale": preview_diff.get("stale").and_then(Value::as_bool).unwrap_or(false),
             "truncated": truncated,
+            "prerequisite_ref": render::scalar_field(&proposal, "prerequisite_git_path"),
+            "prerequisite_repository_link": render::scalar_field(&proposal, "prerequisite_git_repository_link"),
         });
         return Ok(OperationResult::new(text)
             .with_source_url(source_url)
@@ -282,17 +287,83 @@ async fn view_preview_diffs(
     request: &Request,
 ) -> Result<OperationResult> {
     let (_, proposal) = request_merge_proposal(client, request).await?;
-    let preview_diffs = get_preview_diffs(client, &proposal).await?;
+    let mut preview_diffs = get_preview_diffs(client, &proposal).await?;
+    let mut deleted_files = Vec::new();
+    for preview_diff in &mut preview_diffs {
+        let Some(diffstat) = preview_diff
+            .get_mut("diffstat")
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        if !diffstat.contains_key("dev/null") && !diffstat.contains_key("/dev/null") {
+            continue;
+        }
+        let diff_text = get_diff_text(preview_diff).await?;
+        let deletions = diff::deleted_file_stats(&diff_text);
+        if deletions.is_empty() {
+            return Err(Error::invalid(
+                "preview diff contains a dev/null diffstat entry without a deleted source path",
+            ));
+        }
+        let id = preview_diff_id(preview_diff)?;
+        let diffstat = preview_diff
+            .get_mut("diffstat")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| Error::invalid("preview diff has invalid diffstat"))?;
+        diffstat.remove("dev/null");
+        diffstat.remove("/dev/null");
+        for (path, counts) in deletions {
+            diffstat
+                .entry(path.clone())
+                .or_insert_with(|| json!(counts));
+            deleted_files.push(format!(
+                "- Preview diff {id}: {path:?} (+{}/-{})",
+                counts[0], counts[1]
+            ));
+        }
+    }
     let current = get_preview_diff(client, &proposal, None).await?;
     let current_id = preview_diff_id(&current)?;
     let source_url = render::text_field(&proposal, "web_link").map(str::to_owned);
     let proposal_id =
         render::resource_id(&proposal).ok_or_else(|| Error::invalid("merge proposal has no ID"))?;
-    let text = render::render_preview_diffs(&preview_diffs, current_id, &proposal_id);
+    let mut text = render::render_preview_diffs(
+        &preview_diffs,
+        current_id,
+        &proposal_id,
+        render::text_field(&proposal, "prerequisite_git_path"),
+    );
+    let mut revisions = String::new();
+    for (label, key) in [
+        ("Prerequisite revision", "prerequisite_revision_id"),
+        ("Source revision", "source_revision_id"),
+        ("Target revision", "target_revision_id"),
+    ] {
+        if let Some(revision) = render::text_field(&current, key) {
+            revisions.push_str(&format!("\n- **{label}:** `{revision}`"));
+        }
+    }
+    if !revisions.is_empty() {
+        text.push_str("\n\n## Current preview revisions");
+        text.push_str(&revisions);
+    }
+    if !deleted_files.is_empty() {
+        text.push_str("\n\n## Deleted files\n");
+        text.push_str(&deleted_files.join("\n"));
+    }
     let details = json!({
         "kind": "preview_diff_history",
         "current_preview_diff_id": current_id,
+        "current_preview_diff": {
+            "id": current_id,
+            "prerequisite_revision_id": current.get("prerequisite_revision_id"),
+            "source_revision_id": current.get("source_revision_id"),
+            "target_revision_id": current.get("target_revision_id"),
+        },
         "preview_diffs": preview_diffs,
+        "prerequisite_ref": render::scalar_field(&proposal, "prerequisite_git_path"),
+        "prerequisite_repository_link": render::scalar_field(&proposal, "prerequisite_git_repository_link"),
     });
     Ok(OperationResult::new(text)
         .with_source_url(source_url)
@@ -1579,6 +1650,86 @@ async fn create_bug(client: &LaunchpadClient, request: &Request) -> Result<Opera
         .with_details(details))
 }
 
+struct PreparedMergeProposal {
+    source_link: String,
+    target_link: String,
+    prerequisite_link: Option<String>,
+}
+
+async fn prepare_merge_proposal(
+    client: &LaunchpadClient,
+    source_repository: &str,
+    source_ref: &str,
+    target_repository: &str,
+    target_ref: &str,
+    prerequisite_ref: Option<&str>,
+) -> Result<PreparedMergeProposal> {
+    let source = find_git_ref(client, "source", source_repository, source_ref).await?;
+    let target = find_git_ref(client, "target", target_repository, target_ref).await?;
+    let source_link = source.self_link.ok_or_else(|| {
+        Error::invalid(format!(
+            "source ref {} in repository {source_repository} has no API link",
+            normalise_ref(source_ref)
+        ))
+    })?;
+    let target_link = target.self_link.ok_or_else(|| {
+        Error::invalid(format!(
+            "target ref {} in repository {target_repository} has no API link",
+            normalise_ref(target_ref)
+        ))
+    })?;
+    let prerequisite_link = if let Some(path) = prerequisite_ref {
+        let git_ref = find_git_ref(client, "prerequisite", source_repository, path).await?;
+        Some(git_ref.self_link.ok_or_else(|| {
+            Error::invalid(format!(
+                "prerequisite ref {} in repository {source_repository} has no API link",
+                normalise_ref(path)
+            ))
+        })?)
+    } else {
+        None
+    };
+    Ok(PreparedMergeProposal {
+        source_link,
+        target_link,
+        prerequisite_link,
+    })
+}
+
+async fn submit_merge_proposal(
+    client: &LaunchpadClient,
+    prepared: &PreparedMergeProposal,
+    description: Option<&str>,
+    commit_message: Option<&str>,
+    needs_review: bool,
+) -> Result<String> {
+    let needs_review = needs_review.to_string();
+    let mut parameters = vec![
+        ("ws.op", "createMergeProposal"),
+        ("merge_target", prepared.target_link.as_str()),
+        ("initial_comment", description.unwrap_or_default()),
+        ("needs_review", needs_review.as_str()),
+    ];
+    if let Some(link) = prepared.prerequisite_link.as_deref() {
+        parameters.push(("merge_prerequisite", link));
+    }
+    if let Some(commit_message) = commit_message {
+        parameters.push(("commit_message", commit_message));
+    }
+    client
+        .post_pairs_url_created_location(&prepared.source_link, &parameters)
+        .await
+        .map_err(|source| {
+            Error::context(
+                format!(
+                    "cannot create merge proposal from {} to {}",
+                    prepared.source_link, prepared.target_link
+                ),
+                source.into(),
+            )
+        })
+}
+
 async fn create_merge_proposal(
     client: &LaunchpadClient,
     request: &Request,
@@ -1592,47 +1743,29 @@ async fn create_merge_proposal(
         .unwrap_or_else(|| source_repository.clone());
     let source_ref = request.string(&request.source_ref, "source_ref")?;
     let target_ref = request.string(&request.target_ref, "target_ref")?;
-    let source = find_git_ref(client, "source", &source_repository, source_ref).await?;
-    let target = find_git_ref(client, "target", &target_repository, target_ref).await?;
-    let source_link = source.self_link.as_deref().ok_or_else(|| {
-        Error::invalid(format!(
-            "source ref {} in repository {source_repository} has no API link",
-            normalise_ref(source_ref)
-        ))
+    let prepared = prepare_merge_proposal(
+        client,
+        &source_repository,
+        source_ref,
+        &target_repository,
+        target_ref,
+        request.merge_prerequisite.as_deref(),
+    )
+    .await?;
+    let location = submit_merge_proposal(
+        client,
+        &prepared,
+        request.description.as_deref(),
+        request.commit_message.as_deref(),
+        request.needs_review.unwrap_or(true),
+    )
+    .await?;
+    let proposal: Value = client.get_url(&location).await.map_err(|source| {
+        Error::context(
+            format!("cannot load created merge proposal {location}"),
+            source.into(),
+        )
     })?;
-    let target_link = target.self_link.as_deref().ok_or_else(|| {
-        Error::invalid(format!(
-            "target ref {} in repository {target_repository} has no API link",
-            normalise_ref(target_ref)
-        ))
-    })?;
-    let needs_review = request.needs_review.unwrap_or(true).to_string();
-    let mut parameters = vec![
-        ("ws.op", "createMergeProposal"),
-        ("merge_target", target_link),
-        (
-            "initial_comment",
-            request.description.as_deref().unwrap_or_default(),
-        ),
-        ("needs_review", needs_review.as_str()),
-    ];
-    if let Some(commit_message) = request.commit_message.as_deref() {
-        parameters.push(("commit_message", commit_message));
-    }
-    let location = client
-        .post_pairs_url_created_location(source_link, &parameters)
-        .await
-        .map_err(|source| Error::context(format!(
-            "cannot create merge proposal from source {source_repository}:{} to target {target_repository}:{}",
-            normalise_ref(source_ref), normalise_ref(target_ref)
-        ), source.into()))?;
-    let proposal: Value = client.get_url(&location).await.map_err(|source| Error::context(
-        format!(
-            "cannot load merge proposal created from source {source_repository}:{} to target {target_repository}:{}",
-            normalise_ref(source_ref), normalise_ref(target_ref)
-        ),
-        source.into(),
-    ))?;
     let text = format!(
         "# Created Launchpad merge proposal\n\n{}",
         render::render_proposal(&proposal, &[], &[], false, 1)
@@ -1641,6 +1774,103 @@ async fn create_merge_proposal(
     let details = proposal_details(client, &proposal).await?;
     Ok(OperationResult::new(text)
         .with_source_url(source_url)
+        .with_details(details))
+}
+
+async fn replace_merge_proposal_prerequisite(
+    client: &LaunchpadClient,
+    request: &Request,
+) -> Result<OperationResult> {
+    let (_, previous) = request_merge_proposal(client, request).await?;
+    let previous_status = render::text_field(&previous, "queue_status")
+        .ok_or_else(|| Error::invalid("merge proposal has no status"))?;
+    if !matches!(
+        previous_status,
+        "Work in progress" | "Needs review" | "Approved" | "Rejected"
+    ) {
+        return Err(Error::invalid(format!(
+            "cannot replace a merge proposal in status {previous_status}"
+        )));
+    }
+    let prerequisite = request.string(&request.merge_prerequisite, "merge_prerequisite")?;
+    if render::text_field(&previous, "prerequisite_git_path")
+        == Some(normalise_ref(prerequisite).as_str())
+    {
+        return Err(Error::invalid(
+            "merge proposal already has this prerequisite",
+        ));
+    }
+    let source_repository =
+        linked_resource(client, &previous, "source_git_repository_link").await?;
+    let target_repository =
+        linked_resource(client, &previous, "target_git_repository_link").await?;
+    let source_repository = render::text_field(&source_repository, "unique_name")
+        .ok_or_else(|| Error::invalid("merge proposal has no source repository name"))?;
+    let target_repository = render::text_field(&target_repository, "unique_name")
+        .ok_or_else(|| Error::invalid("merge proposal has no target repository name"))?;
+    let source_ref = render::text_field(&previous, "source_git_path")
+        .ok_or_else(|| Error::invalid("merge proposal has no source ref"))?;
+    let target_ref = render::text_field(&previous, "target_git_path")
+        .ok_or_else(|| Error::invalid("merge proposal has no target ref"))?;
+    let previous_url = proposal_api_url(&previous)?;
+    let prepared = prepare_merge_proposal(
+        client,
+        source_repository,
+        source_ref,
+        target_repository,
+        target_ref,
+        Some(prerequisite),
+    )
+    .await?;
+    client
+        .post_pairs_url_ok(
+            previous_url.as_str(),
+            &[("ws.op", "setStatus"), ("status", "Superseded")],
+        )
+        .await?;
+    let location = match submit_merge_proposal(
+        client,
+        &prepared,
+        render::text_field(&previous, "description"),
+        render::text_field(&previous, "commit_message"),
+        previous_status != "Work in progress",
+    )
+    .await
+    {
+        Ok(location) => location,
+        Err(source) => {
+            let rollback = client
+                .post_pairs_url_ok(
+                    previous_url.as_str(),
+                    &[("ws.op", "setStatus"), ("status", previous_status)],
+                )
+                .await;
+            return Err(match rollback {
+                Ok(()) => Error::context(
+                    "cannot create replacement; previous status restored",
+                    source,
+                ),
+                Err(rollback_error) => Error::invalid(format!(
+                    "cannot create replacement: {source}; previous proposal {previous_url} remains Superseded because rollback failed: {rollback_error}"
+                )),
+            });
+        }
+    };
+    let replacement: Value = client.get_url(&location).await.map_err(|source| {
+        Error::context(
+            format!("replacement created at {location}, but cannot load it; previous proposal {previous_url} is Superseded"),
+            source.into(),
+        )
+    })?;
+    let replacement_url = render::text_field(&replacement, "web_link").unwrap_or(&location);
+    let text = format!(
+        "# Replaced Launchpad merge proposal\n\n- **Previous:** {previous_url} (Superseded)\n- **Replacement:** {replacement_url}\n\n{}",
+        render::render_proposal(&replacement, &[], &[], false, 1)
+    );
+    let mut details = proposal_details(client, &replacement).await?;
+    details["supersedes"] = json!(previous_url.as_str());
+    Ok(OperationResult::new(text)
+        .with_source_url(Some(replacement_url.to_owned()))
         .with_details(details))
 }
 
@@ -2354,12 +2584,46 @@ async fn find_git_ref(
 ) -> Result<GitRef> {
     let requested_path = normalise_ref(requested_path);
     let context = format!("cannot resolve {role} ref {requested_path} in repository {repository}");
-    let resource = get_repository(client, repository).await.map_err(|source| {
-        Error::context(
-            format!("cannot resolve {role} repository {repository} for ref {requested_path}"),
-            source,
-        )
-    })?;
+    let resource = match get_repository(client, repository).await {
+        Ok(resource) => resource,
+        Err(source) => {
+            let lookup_context =
+                format!("cannot resolve {role} repository {repository} for ref {requested_path}");
+            if !matches!(
+                &source,
+                Error::Launchpad {
+                    source: LpError::NotFound(_) | LpError::Api { status: 404, .. }
+                }
+            ) {
+                return Err(Error::context(lookup_context, source));
+            }
+            let path = normalise_repository(repository)
+                .map_err(|error| Error::context(lookup_context.clone(), error))?;
+            let Some((owner, name)) = path.split_once('/') else {
+                return Err(Error::context(lookup_context, source));
+            };
+            if !owner.starts_with('~') || owner.len() == 1 || name.is_empty() || name.contains('/')
+            {
+                return Err(Error::context(lookup_context, source));
+            }
+            let alias = format!("{path}/+git/{name}");
+            get_repository(client, &alias).await.map_err(|source| {
+                let guidance = if matches!(
+                    &source,
+                    Error::Launchpad {
+                        source: LpError::NotFound(_) | LpError::Api { status: 404, .. }
+                    }
+                ) {
+                    format!(
+                        "{lookup_context}; neither {path} nor {alias} was found; provide the exact canonical repository path lp://{path}/+git/<repository>"
+                    )
+                } else {
+                    format!("{lookup_context}; alias lookup {alias} failed")
+                };
+                Error::context(guidance, source)
+            })?
+        }
+    };
     let canonical_repository = render::text_field(&resource, "unique_name")
         .filter(|name| !name.trim().is_empty())
         .ok_or_else(|| {
@@ -2388,6 +2652,12 @@ async fn find_git_ref(
 async fn proposal_details(client: &LaunchpadClient, proposal: &Value) -> Result<Value> {
     let source_repository = linked_resource(client, proposal, "source_git_repository_link").await?;
     let target_repository = linked_resource(client, proposal, "target_git_repository_link").await?;
+    let prerequisite_repository =
+        if let Some(link) = render::text_field(proposal, "prerequisite_git_repository_link") {
+            Some(client.get_url::<Value>(link).await?)
+        } else {
+            None
+        };
     Ok(json!({
         "kind": "branch_merge_proposal",
         "id": render::resource_id(proposal),
@@ -2395,6 +2665,8 @@ async fn proposal_details(client: &LaunchpadClient, proposal: &Value) -> Result<
         "status": render::scalar_field(proposal, "queue_status"),
         "source_ref": render::scalar_field(proposal, "source_git_path"),
         "target_ref": render::scalar_field(proposal, "target_git_path"),
+        "prerequisite_ref": render::scalar_field(proposal, "prerequisite_git_path"),
+        "prerequisite_repository": prerequisite_repository.as_ref().and_then(|repository| render::scalar_field(repository, "unique_name")),
         "source_repository": render::scalar_field(&source_repository, "unique_name"),
         "target_repository": render::scalar_field(&target_repository, "unique_name"),
         "source_https_url": render::scalar_field(&source_repository, "git_https_url"),
@@ -2504,6 +2776,7 @@ mod tests {
         validate_current_preview_diff, view_merge_proposal_for_branch,
     };
     use crate::request::{DiscussionFormat, Request, ResourceTarget};
+    use tokio::sync::mpsc;
 
     async fn read_request_headers(stream: &mut TcpStream) -> String {
         let mut request = Vec::new();
@@ -2516,6 +2789,37 @@ mod tests {
                 return String::from_utf8(request).unwrap();
             }
         }
+    }
+
+    async fn read_http_request(stream: &mut TcpStream) -> (String, String) {
+        let mut bytes = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0; 1024];
+            let size = stream.read(&mut chunk).await.unwrap();
+            assert!(size > 0, "client closed before completing request");
+            bytes.extend_from_slice(&chunk[..size]);
+            if let Some(position) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        while bytes.len() < header_end + content_length {
+            let mut chunk = [0; 1024];
+            let size = stream.read(&mut chunk).await.unwrap();
+            assert!(size > 0, "client closed before completing request body");
+            bytes.extend_from_slice(&chunk[..size]);
+        }
+        let body =
+            String::from_utf8(bytes[header_end..header_end + content_length].to_vec()).unwrap();
+        (headers, body)
     }
 
     #[tokio::test]
@@ -2822,6 +3126,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolves_two_segment_ssh_alias_after_canonical_lookup_misses() {
+        let canonical = "~owner/project/+git/project";
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (expected, status, body) in [
+                ("~owner/project", "404 Not Found", "{}".to_owned()),
+                (
+                    canonical,
+                    "200 OK",
+                    json!({ "unique_name": canonical }).to_string(),
+                ),
+                (
+                    "~owner/project/+git/project/refs",
+                    "200 OK",
+                    json!({
+                        "entries": [{
+                            "path": "refs/heads/feature",
+                            "self_link": format!("http://{address}/devel/{canonical}/+ref/feature"),
+                        }],
+                        "next_collection_link": null,
+                    })
+                    .to_string(),
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request_headers(&mut stream).await;
+                let path = request.split_ascii_whitespace().nth(1).unwrap_or_default();
+                let url = Url::parse(&format!("http://localhost{path}")).unwrap();
+                if let Some(requested) = url.query_pairs().find(|(key, _)| key == "path") {
+                    assert_eq!(requested.1, expected);
+                } else {
+                    assert_eq!(url.path(), format!("/devel/{expected}"));
+                }
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client = LaunchpadClient::new(None).with_base_url(format!("http://{address}/devel"));
+        let git_ref = find_git_ref(
+            &client,
+            "source",
+            "git+ssh://git@git.launchpad.net/~owner/project",
+            "feature",
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(git_ref.path.as_deref(), Some("refs/heads/feature"));
+        assert_eq!(
+            git_ref.self_link.as_deref(),
+            Some(format!("http://{address}/devel/{canonical}/+ref/feature").as_str())
+        );
+    }
+
+    #[tokio::test]
     async fn missing_related_git_ref_returns_no_proposals() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -3009,5 +3372,227 @@ mod tests {
                 .to_string()
                 .contains("preview diff 102 is marked stale")
         );
+    }
+    async fn proposal_scenario(
+        reject_creation: bool,
+        create_only: bool,
+    ) -> (
+        crate::result::Result<crate::response::OperationResult>,
+        Vec<String>,
+        Vec<(String, String)>,
+    ) {
+        let repository = "~owner/project/+git/repo";
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let base = format!("http://{address}/devel");
+        let (statuses_tx, mut statuses_rx) = mpsc::unbounded_channel();
+        let (creation_tx, mut creation_rx) = mpsc::unbounded_channel();
+        let server_base = base.clone();
+        let server = tokio::spawn(async move {
+            let mut status = "Needs review".to_owned();
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (headers, body) = read_http_request(&mut stream).await;
+                let mut request = headers.split_ascii_whitespace();
+                let method = request.next().unwrap();
+                let path = request.next().unwrap();
+                let proposal_path = format!("/devel/{repository}/+merge/42");
+                let new_path = format!("/devel/{repository}/+merge/43");
+                let refs_path = format!("/devel/{repository}/refs");
+                let source_path = format!("/devel/{repository}/+ref/feature");
+                let parameters: Vec<_> = url::form_urlencoded::parse(body.as_bytes())
+                    .into_owned()
+                    .collect();
+                let (code, response, location) = if method == "GET" && path == proposal_path {
+                    (
+                        "200 OK",
+                        json!({
+                            "id": 42,
+                            "self_link": format!("{server_base}/{repository}/+merge/42"),
+                            "web_link": "https://code.launchpad.net/old/+merge/42",
+                            "queue_status": status,
+                            "source_git_repository_link": format!("{server_base}/{repository}"),
+                            "target_git_repository_link": format!("{server_base}/{repository}"),
+                            "source_git_path": "refs/heads/feature",
+                            "target_git_path": "refs/heads/main",
+                            "description": "Stacked change",
+                            "commit_message": "Add dependent feature"
+                        })
+                        .to_string(),
+                        None,
+                    )
+                } else if method == "GET" && path.starts_with("/devel/+git?") {
+                    assert_eq!(
+                        Url::parse(&format!("http://localhost{path}"))
+                            .unwrap()
+                            .query_pairs()
+                            .find(|(key, _)| key == "path")
+                            .unwrap()
+                            .1,
+                        repository
+                    );
+                    (
+                        "200 OK",
+                        json!({ "unique_name": repository }).to_string(),
+                        None,
+                    )
+                } else if method == "GET" && path == refs_path {
+                    let entries: Vec<_> = ["feature", "main", "base"]
+                        .iter()
+                        .map(|name| {
+                            json!({
+                                "path": format!("refs/heads/{name}"),
+                                "self_link": format!("{server_base}/{repository}/+ref/{name}")
+                            })
+                        })
+                        .collect();
+                    (
+                        "200 OK",
+                        json!({ "entries": entries, "next_collection_link": null }).to_string(),
+                        None,
+                    )
+                } else if method == "POST" && path == proposal_path {
+                    let new_status = parameters
+                        .iter()
+                        .find(|(key, _)| key == "status")
+                        .unwrap()
+                        .1
+                        .clone();
+                    status = new_status.clone();
+                    statuses_tx.send(new_status).unwrap();
+                    ("200 OK", "{}".to_owned(), None)
+                } else if method == "POST" && path == source_path {
+                    assert_eq!(
+                        status,
+                        if create_only {
+                            "Needs review"
+                        } else {
+                            "Superseded"
+                        }
+                    );
+                    creation_tx.send(parameters).unwrap();
+                    if reject_creation {
+                        (
+                            "400 Bad Request",
+                            r#"{"message":"rejected"}"#.to_owned(),
+                            None,
+                        )
+                    } else {
+                        (
+                            "201 Created",
+                            "{}".to_owned(),
+                            Some(format!("{server_base}/{repository}/+merge/43")),
+                        )
+                    }
+                } else if method == "GET" && path == new_path {
+                    (
+                        "200 OK",
+                        json!({
+                            "id": 43,
+                            "self_link": format!("{server_base}/{repository}/+merge/43"),
+                            "web_link": "https://code.launchpad.net/new/+merge/43",
+                            "queue_status": "Needs review",
+                            "source_git_repository_link": format!("{server_base}/{repository}"),
+                            "target_git_repository_link": format!("{server_base}/{repository}"),
+                            "source_git_path": "refs/heads/feature",
+                            "target_git_path": "refs/heads/main",
+                            "prerequisite_git_repository_link": format!("{server_base}/{repository}"),
+                            "prerequisite_git_path": "refs/heads/base"
+                        })
+                        .to_string(),
+                        None,
+                    )
+                } else if method == "GET" && path == format!("/devel/{repository}") {
+                    (
+                        "200 OK",
+                        json!({ "unique_name": repository }).to_string(),
+                        None,
+                    )
+                } else {
+                    panic!("unexpected request: {method} {path}");
+                };
+                let location_header =
+                    location.map_or_else(String::new, |url| format!("Location: {url}\r\n"));
+                let reply = format!(
+                    "HTTP/1.1 {code}\r\nContent-Type: application/json\r\n{location_header}Content-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                );
+                stream.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let client = LaunchpadClient::new(None).with_base_url(base);
+        let input = if create_only {
+            json!({
+                "op": "merge_proposal_create",
+                "repository": repository,
+                "source_ref": "feature",
+                "target_ref": "main",
+                "merge_prerequisite": "base",
+                "description": "Stacked change"
+            })
+        } else {
+            json!({
+                "op": "replace_merge_proposal_prerequisite",
+                "target": format!("lp://{repository}/+merge/42"),
+                "merge_prerequisite": "base"
+            })
+        };
+        let request: Request = serde_json::from_value(input).unwrap();
+        request.validate().unwrap();
+        let result = if create_only {
+            super::create_merge_proposal(&client, &request).await
+        } else {
+            super::replace_merge_proposal_prerequisite(&client, &request).await
+        };
+        server.abort();
+        let mut statuses = Vec::new();
+        while let Ok(status) = statuses_rx.try_recv() {
+            statuses.push(status);
+        }
+        let parameters = creation_rx.try_recv().unwrap();
+        (result, statuses, parameters)
+    }
+
+    #[tokio::test]
+    async fn replacement_preserves_main_target_and_sets_prerequisite() {
+        let (result, statuses, parameters) = proposal_scenario(false, false).await;
+        assert_eq!(statuses, ["Superseded"]);
+        let fields: HashMap<_, _> = parameters.into_iter().collect();
+        assert!(fields["merge_target"].ends_with("/+ref/main"));
+        assert!(fields["merge_prerequisite"].ends_with("/+ref/base"));
+        assert_eq!(fields["needs_review"], "true");
+        assert_eq!(fields["initial_comment"], "Stacked change");
+        let result = result.unwrap();
+        assert!(result.text.contains("**Prerequisite:** refs/heads/base"));
+        assert!(result.text.contains("**Target:** refs/heads/main"));
+        assert!(
+            result
+                .text
+                .contains("https://code.launchpad.net/new/+merge/43")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_replacement_restores_old_status() {
+        let (result, statuses, _) = proposal_scenario(true, false).await;
+        assert_eq!(statuses, ["Superseded", "Needs review"]);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("previous status restored")
+        );
+    }
+
+    #[tokio::test]
+    async fn creation_keeps_main_target_separate_from_prerequisite() {
+        let (result, statuses, parameters) = proposal_scenario(false, true).await;
+        assert!(statuses.is_empty());
+        let fields: HashMap<_, _> = parameters.into_iter().collect();
+        assert!(fields["merge_target"].ends_with("/+ref/main"));
+        assert!(fields["merge_prerequisite"].ends_with("/+ref/base"));
+        let result = result.unwrap();
+        assert!(result.text.contains("**Prerequisite:** refs/heads/base"));
+        assert!(result.text.contains("**Target:** refs/heads/main"));
     }
 }

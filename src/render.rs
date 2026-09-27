@@ -114,6 +114,12 @@ fn render_proposal_at_level(
     );
     push_bullet(
         &mut lines,
+        "Prerequisite",
+        scalar_field(proposal, "prerequisite_git_path")
+            .or_else(|| nested_scalar(proposal, "prerequisite_branch", "unique_name")),
+    );
+    push_bullet(
+        &mut lines,
         "Registrant",
         person_field(proposal, "registrant"),
     );
@@ -205,7 +211,12 @@ pub fn render_repository(repository: &Value) -> String {
     lines.join("\n\n")
 }
 
-pub fn render_preview_diffs(preview_diffs: &[Value], current_id: u64, proposal_id: &str) -> String {
+pub fn render_preview_diffs(
+    preview_diffs: &[Value],
+    current_id: u64,
+    proposal_id: &str,
+    prerequisite: Option<&str>,
+) -> String {
     let mut preview_diffs: Vec<_> = preview_diffs.iter().collect();
     preview_diffs.sort_by_key(|preview_diff| {
         preview_diff
@@ -217,6 +228,9 @@ pub fn render_preview_diffs(preview_diffs: &[Value], current_id: u64, proposal_i
     let mut lines = vec![format!(
         "# Preview diff history for merge proposal {proposal_id}"
     )];
+    if let Some(prerequisite) = prerequisite {
+        lines.push(format!("- **Prerequisite:** {prerequisite}"));
+    }
     for preview_diff in preview_diffs {
         let raw_id = preview_diff.get("id").and_then(Value::as_u64);
         let id = raw_id.map_or_else(|| "?".to_owned(), |id| id.to_string());
@@ -471,6 +485,11 @@ pub fn render_proposal_discussion(
         &mut lines,
         "Target",
         scalar_field(proposal, "target_git_path"),
+    );
+    push_bullet(
+        &mut lines,
+        "Prerequisite",
+        scalar_field(proposal, "prerequisite_git_path"),
     );
     push_bullet(
         &mut lines,

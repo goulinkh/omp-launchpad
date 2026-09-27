@@ -268,9 +268,50 @@ fn parse_range_start(range: &str) -> Option<u64> {
     range.split(',').next()?.parse().ok()
 }
 
+/// Read deleted source paths and their added/removed line counts from a Git preview diff.
+pub fn deleted_file_stats(diff: &str) -> Vec<(String, [u64; 2])> {
+    diff.split("diff --git ")
+        .skip(1)
+        .filter_map(|segment| {
+            let mut lines = segment.lines();
+            let source = lines.find_map(|line| line.strip_prefix("--- "))?;
+            let destination = lines.next()?.strip_prefix("+++ ")?;
+            if normalise_path(destination)?.as_str() != "/dev/null" {
+                return None;
+            }
+            let source = normalise_path(source)?;
+            if source == "/dev/null" {
+                return None;
+            }
+            let mut counts = [0_u64; 2];
+            for line in lines {
+                if let Some([added, removed]) = parse_hunk_counts(line) {
+                    counts[0] = counts[0].checked_add(added)?;
+                    counts[1] = counts[1].checked_add(removed)?;
+                }
+            }
+            Some((source, counts))
+        })
+        .collect()
+}
+
+fn parse_hunk_counts(line: &str) -> Option<[u64; 2]> {
+    let line = line.strip_prefix("@@ -")?;
+    let (original, line) = line.split_once(' ')?;
+    let line = line.strip_prefix('+')?;
+    let (modified, _) = line.split_once(" @@")?;
+    let count = |range: &str| -> Option<u64> {
+        match range.split_once(',') {
+            Some((_, count)) => count.parse().ok(),
+            None => Some(1),
+        }
+    };
+    Some([count(modified)?, count(original)?])
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DiffLineKind, DiffSide, locate_diff_line, map_file_line};
+    use super::{DiffLineKind, DiffSide, deleted_file_stats, locate_diff_line, map_file_line};
 
     const DIFF: &str = concat!(
         "diff --git a/src/old.rs b/src/new.rs\n",
@@ -317,6 +358,45 @@ mod tests {
         "@@ -18446744073709551615,1 +1,1 @@\n",
         " context\n",
     );
+
+    #[test]
+    fn deleted_file_stats_preserve_multiple_source_paths_and_hunk_sides() {
+        let diff = concat!(
+            "diff --git a/old.rs b/new.rs\n",
+            "rename from old.rs\n",
+            "rename to new.rs\n",
+            "--- a/old.rs\n",
+            "+++ b/new.rs\n",
+            "@@ -1 +1,2 @@\n",
+            "-old\n",
+            "+new\n",
+            "+again\n",
+            "diff --git \"a/old name.rs\" \"b/old name.rs\"\n",
+            "deleted file mode 100644\n",
+            "--- \"a/old name.rs\"\n",
+            "+++ /dev/null\n",
+            "@@ -2,3 +0,0 @@\n",
+            "-one\n",
+            "-two\n",
+            "-three\n",
+            "@@ -12,2 +0,0 @@\n",
+            "-four\n",
+            "-five\n",
+            "diff --git \"a/\\303\\251.rs\" \"b/\\303\\251.rs\"\n",
+            "deleted file mode 100644\n",
+            "--- \"a/\\303\\251.rs\"\n",
+            "+++ /dev/null\n",
+            "@@ -1 +0,0 @@\n",
+            "-last\n",
+        );
+        assert_eq!(
+            deleted_file_stats(diff),
+            vec![
+                ("old name.rs".to_owned(), [0, 5]),
+                ("é.rs".to_owned(), [0, 1]),
+            ]
+        );
+    }
 
     #[test]
     fn maps_modified_file_line_to_global_diff_line() {
