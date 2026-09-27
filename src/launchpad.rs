@@ -60,6 +60,7 @@ pub async fn execute(request: &Request) -> Result<OperationResult> {
         Operation::DiffLineMap => map_diff_line(&client, request).await,
         Operation::BugCreate => create_bug(&client, request).await,
         Operation::MergeProposalCreate => create_merge_proposal(&client, request).await,
+        Operation::MergeProposalEdit => edit_merge_proposal(&client, request).await,
         Operation::ReplaceMergeProposalPrerequisite => {
             replace_merge_proposal_prerequisite(&client, request).await
         }
@@ -1743,6 +1744,7 @@ async fn create_merge_proposal(
         .unwrap_or_else(|| source_repository.clone());
     let source_ref = request.string(&request.source_ref, "source_ref")?;
     let target_ref = request.string(&request.target_ref, "target_ref")?;
+    let commit_message = request.string(&request.commit_message, "commit_message")?;
     let prepared = prepare_merge_proposal(
         client,
         &source_repository,
@@ -1756,7 +1758,7 @@ async fn create_merge_proposal(
         client,
         &prepared,
         request.description.as_deref(),
-        request.commit_message.as_deref(),
+        Some(commit_message),
         request.needs_review.unwrap_or(true),
     )
     .await?;
@@ -1772,6 +1774,36 @@ async fn create_merge_proposal(
     );
     let source_url = render::text_field(&proposal, "web_link").map(str::to_owned);
     let details = proposal_details(client, &proposal).await?;
+    Ok(OperationResult::new(text)
+        .with_source_url(source_url)
+        .with_details(details))
+}
+
+async fn edit_merge_proposal(
+    client: &LaunchpadClient,
+    request: &Request,
+) -> Result<OperationResult> {
+    let (_, proposal) = request_merge_proposal(client, request).await?;
+    let url = proposal_api_url(&proposal)?;
+    let mut changes = serde_json::Map::new();
+    if let Some(message) = request.commit_message.as_deref() {
+        changes.insert("commit_message".to_owned(), json!(message));
+    }
+    if let Some(description) = request.description.as_deref() {
+        changes.insert("description".to_owned(), json!(description));
+    }
+    let updated: Value = client
+        .patch_url_with_value(url.as_str(), &Value::Object(changes))
+        .await
+        .map_err(|source| {
+            Error::context(format!("cannot edit merge proposal {url}"), source.into())
+        })?;
+    let source_url = render::text_field(&updated, "web_link").map(str::to_owned);
+    let text = format!(
+        "# Updated Launchpad merge proposal\n\n{}",
+        render::render_proposal(&updated, &[], &[], false, 1)
+    );
+    let details = proposal_details(client, &updated).await?;
     Ok(OperationResult::new(text)
         .with_source_url(source_url)
         .with_details(details))
@@ -3492,6 +3524,7 @@ mod tests {
                             "self_link": format!("{server_base}/{repository}/+merge/43"),
                             "web_link": "https://code.launchpad.net/new/+merge/43",
                             "queue_status": "Needs review",
+                            "commit_message": "Add dependent feature",
                             "source_git_repository_link": format!("{server_base}/{repository}"),
                             "target_git_repository_link": format!("{server_base}/{repository}"),
                             "source_git_path": "refs/heads/feature",
@@ -3528,7 +3561,8 @@ mod tests {
                 "source_ref": "feature",
                 "target_ref": "main",
                 "merge_prerequisite": "base",
-                "description": "Stacked change"
+                "description": "Stacked change",
+                "commit_message": "Add dependent feature"
             })
         } else {
             json!({
@@ -3591,8 +3625,92 @@ mod tests {
         let fields: HashMap<_, _> = parameters.into_iter().collect();
         assert!(fields["merge_target"].ends_with("/+ref/main"));
         assert!(fields["merge_prerequisite"].ends_with("/+ref/base"));
+        assert_eq!(fields["commit_message"], "Add dependent feature");
         let result = result.unwrap();
         assert!(result.text.contains("**Prerequisite:** refs/heads/base"));
         assert!(result.text.contains("**Target:** refs/heads/main"));
+        assert!(
+            result
+                .text
+                .contains("Merge proposal 43: Add dependent feature")
+        );
+    }
+
+    #[tokio::test]
+    async fn editing_commit_message_keeps_the_proposal_and_description() {
+        let repository = "~owner/project/+git/repo";
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let base = format!("http://{address}/devel");
+        let server_base = base.clone();
+        let server = tokio::spawn(async move {
+            let proposal_path = format!("/devel/{repository}/+merge/42");
+            let repository_path = format!("/devel/{repository}");
+            let mut proposal = json!({
+                "id": 42,
+                "self_link": format!("{server_base}/{repository}/+merge/42"),
+                "web_link": "https://code.launchpad.net/~owner/project/+git/repo/+merge/42",
+                "queue_status": "Needs review",
+                "source_git_repository_link": format!("{server_base}/{repository}"),
+                "target_git_repository_link": format!("{server_base}/{repository}"),
+                "source_git_path": "refs/heads/feature",
+                "target_git_path": "refs/heads/main",
+                "description": "The original explanation of this change",
+                "commit_message": null
+            });
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (headers, body) = read_http_request(&mut stream).await;
+                let mut request = headers.split_ascii_whitespace();
+                let method = request.next().unwrap();
+                let path = request.next().unwrap();
+                let response = match (method, path) {
+                    ("GET", requested) if requested == proposal_path => proposal.clone(),
+                    ("PATCH", requested) if requested == proposal_path => {
+                        assert_eq!(
+                            serde_json::from_str::<Value>(&body).unwrap(),
+                            json!({ "commit_message": "Correct concise title" })
+                        );
+                        proposal["commit_message"] = json!("Correct concise title");
+                        proposal.clone()
+                    }
+                    ("GET", requested) if requested == repository_path => {
+                        json!({ "unique_name": repository })
+                    }
+                    _ => panic!("unexpected request: {method} {path}"),
+                };
+                let body = response.to_string();
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(reply.as_bytes()).await.unwrap();
+            }
+            assert_eq!(proposal["commit_message"], "Correct concise title");
+        });
+        let client = LaunchpadClient::new(None).with_base_url(base);
+        let request: Request = serde_json::from_value(json!({
+            "op": "merge_proposal_edit",
+            "target": format!("lp://{repository}/+merge/42"),
+            "commit_message": "Correct concise title"
+        }))
+        .unwrap();
+        request.validate().unwrap();
+        let result = super::edit_merge_proposal(&client, &request).await.unwrap();
+        server.await.unwrap();
+        assert!(
+            result
+                .text
+                .contains("Merge proposal 42: Correct concise title")
+        );
+        assert!(
+            result
+                .text
+                .contains("The original explanation of this change")
+        );
+        assert_eq!(
+            result.source_url.as_deref(),
+            Some("https://code.launchpad.net/~owner/project/+git/repo/+merge/42")
+        );
     }
 }

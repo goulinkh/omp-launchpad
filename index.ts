@@ -263,8 +263,8 @@ export default function launchpadExtension(pi: ExtensionAPI) {
     name: "launchpad_write",
     label: "Launchpad Write",
     description:
-      "Mutate Launchpad or local Git state: create or replace merge proposals, create bugs, add comments, update inline review " +
-      "drafts, submit reviews, change proposal status, check out a proposal, or push its checked-out branch.",
+      "Mutate Launchpad or local Git state: create or replace merge proposals, edit proposal metadata, create bugs, " +
+      "add comments, update inline review drafts, submit reviews, change proposal status, check out or push branches.",
     parameters: z.union([
       z.object({
         op: z.literal("bug_create"),
@@ -280,13 +280,20 @@ export default function launchpadExtension(pi: ExtensionAPI) {
         repository: z.string(),
         target_repository: z.string().optional(),
         source_ref: z.string(),
-        target_ref: z.string(),
-        merge_prerequisite: z.string().optional(),
+        target_ref: z.string().describe("Merge destination Git ref, such as main; do not use the prerequisite branch here."),
+        merge_prerequisite: z.string().optional().describe("Optional prerequisite Git ref in the source repository; Launchpad exposes it as prerequisite_git_path on proposal reads."),
         description: z.string().optional(),
-        commit_message: z.string().optional(),
+        commit_message: z.string().min(1).describe("Required merge commit message; used as the proposal title."),
         needs_review: z.boolean().optional(),
         ...withIntent,
       }),
+      z.object({
+        op: z.literal("merge_proposal_edit"),
+        target: mergeProposalTarget,
+        commit_message: z.string().optional(),
+        description: z.string().optional(),
+        ...withIntent,
+      }).strict().describe("Edit commit_message or description on the same proposal. Prerequisites are immutable; use replace_merge_proposal_prerequisite."),
       z.object({
         op: z.literal("comment"),
         target: mergeProposalTarget,

@@ -37,6 +37,7 @@ pub enum Operation {
     DiffLineMap,
     BugCreate,
     MergeProposalCreate,
+    MergeProposalEdit,
     ReplaceMergeProposalPrerequisite,
     Comment,
     ReviewDraftUpdate,
@@ -53,6 +54,7 @@ impl Operation {
             Self::ReviewDrafts
                 | Self::BugCreate
                 | Self::MergeProposalCreate
+                | Self::MergeProposalEdit
                 | Self::ReplaceMergeProposalPrerequisite
                 | Self::Comment
                 | Self::ReviewDraftUpdate
@@ -190,11 +192,13 @@ impl Request {
                 ("repository", &self.repository),
                 ("source_ref", &self.source_ref),
                 ("target_ref", &self.target_ref),
+                ("commit_message", &self.commit_message),
             ],
             Operation::ReplaceMergeProposalPrerequisite => &[
                 ("target", &self.target),
                 ("merge_prerequisite", &self.merge_prerequisite),
             ],
+            Operation::MergeProposalEdit => &[("target", &self.target)],
             Operation::Comment => &[("target", &self.target), ("body", &self.body)],
             Operation::SetMergeProposalStatus => &[("target", &self.target)],
             Operation::MergeProposalCheckout => &[("target", &self.target)],
@@ -252,6 +256,22 @@ impl Request {
             if prerequisite.trim().is_empty() {
                 return Err(Error::invalid("merge_prerequisite cannot be empty"));
             }
+        }
+        if self.op == Operation::MergeProposalEdit
+            && self.commit_message.is_none()
+            && self.description.is_none()
+        {
+            return Err(Error::invalid(
+                "merge_proposal_edit requires commit_message or description",
+            ));
+        }
+        if self.commit_message.is_some()
+            && matches!(
+                self.op,
+                Operation::MergeProposalCreate | Operation::MergeProposalEdit
+            )
+        {
+            self.string(&self.commit_message, "commit_message")?;
         }
         if self.op == Operation::SetMergeProposalStatus {
             self.status()?;
@@ -929,6 +949,27 @@ mod tests {
                 .to_string()
                 .contains("require inline comments")
         );
+    }
+
+    #[test]
+    fn creation_requires_a_nonblank_commit_message() {
+        for message in [None, Some("  ")] {
+            let request: Request = serde_json::from_value(serde_json::json!({
+                "op": "merge_proposal_create",
+                "repository": "~owner/project/+git/repo",
+                "source_ref": "feature",
+                "target_ref": "main",
+                "commit_message": message
+            }))
+            .unwrap();
+            assert!(
+                request
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("commit_message")
+            );
+        }
     }
 
     #[test]

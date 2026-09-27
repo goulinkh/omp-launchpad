@@ -97,7 +97,7 @@ status (`statusLine.showHookStatus: false`) remains hidden.
 The dedicated tools expose these operations:
 
 - `launchpad`: `resource_view`, `repo_view`, `file_read`, `search_bugs`, `search_merge_proposals`, `merge_proposal_for_branch`, `current_merge_proposal`, `merge_proposal_discussion`, `preview_diffs`, `inline_comments`, `review_drafts`, `diff_line_map`
-- `launchpad_write`: `bug_create`, `merge_proposal_create`, `replace_merge_proposal_prerequisite`, `comment`, `review_draft_update`, `review_submit`, `set_merge_proposal_status`, `merge_proposal_checkout`, `merge_proposal_push`
+- `launchpad_write`: `bug_create`, `merge_proposal_create`, `merge_proposal_edit`, `replace_merge_proposal_prerequisite`, `comment`, `review_draft_update`, `review_submit`, `set_merge_proposal_status`, `merge_proposal_checkout`, `merge_proposal_push`
 
 For `resource_view`, `preview_diff_id` selects that snapshot's diff. The target may be a numeric merge-proposal ID or a merge-proposal URL and does not need a `/diff` suffix.
 
@@ -122,9 +122,11 @@ Use launchpad with op merge_proposal_discussion, comments inline, current_diff_o
 
 Use launchpad with op preview_diffs for lp://~owner/project/+git/repository/+merge/123.
 
-Create a merge proposal from feature-2 into main with feature-1 as merge_prerequisite.
+Create a merge proposal from feature-2 into main with feature-1 as merge_prerequisite and commit_message "Add the dependent feature".
 
 Replace the prerequisite on lp://~owner/project/+git/repository/+merge/123 with feature-1.
+
+Edit the commit_message on lp://~owner/project/+git/repository/+merge/123 without changing its URL.
 
 Map modified file line 42 in src/main.rs to a global diff line for preview diff 456, then save an inline draft there.
 
@@ -139,23 +141,30 @@ proposal targets also accept a numeric ID such as `511601` when the working
 checkout has a related Launchpad remote; use the full Launchpad URL or path
 when no repository context is available.
 
-Merge-proposal creation resolves the source, target, and optional
-`merge_prerequisite` refs. The prerequisite is looked up in the source
-repository, while `target_ref` remains the merge destination (for example,
-`main`). Git SSH aliases such as `~owner/project` fall back to
+Merge-proposal creation resolves `source_ref`, `target_ref`, and optional
+`merge_prerequisite` Git refs. Set `target_ref` to the merge destination (for
+example, `main`) and `merge_prerequisite` to the branch the source builds on.
+Launchpad calls the resulting read-only proposal field `prerequisite_git_path`;
+it is not a creation parameter. The prerequisite is looked up in the source
+repository. Git SSH aliases such as `~owner/project` fall back to
 `~owner/project/+git/project` when Launchpad cannot resolve the short path;
 other unresolved aliases report the canonical `lp://` path to supply.
+Creation requires a nonblank `commit_message`; Launchpad uses it as the
+proposal title. `description` remains optional and does not supply a title.
 Proposal reads and `preview_diffs` show the prerequisite; preview history
 includes the prerequisite revision used by Launchpad to generate the diff.
 Deleted files in preview diffstat are reported by their source paths rather
 than Launchpad's `dev/null` placeholder.
 
-Launchpad cannot edit an existing proposal's prerequisite. The
-`replace_merge_proposal_prerequisite` operation creates a new proposal with
-the original source and target, description, and commit message, and marks
-the old proposal Superseded. It changes the proposal URL and does not move
-comments or reviews. If creation fails, the tool attempts to restore the old
-status and reports if restoration also fails.
+`merge_proposal_edit` changes `commit_message` and/or `description` on the
+same proposal via Launchpad's writable fields. It cannot change the source,
+target, or prerequisite refs. Launchpad cannot edit a prerequisite in place:
+`replace_merge_proposal_prerequisite` creates a new proposal with the
+original source and target, description, and commit message, then marks the
+old proposal Superseded. This changes the URL and does not move comments or
+reviews. If creation fails, the tool attempts to restore the old status and
+reports if restoration also fails. Changing a merge target requires a new
+proposal.
 
 `current_merge_proposal` inspects the working directory, current branch, and
 all Git remotes. It prefers a Launchpad `origin`, otherwise the first Launchpad
