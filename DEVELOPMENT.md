@@ -265,7 +265,7 @@ omp plugin link "$PWD"
 omp plugin list --json
 ```
 
-The list must show `omp-launchpad`, version `0.5.2`, with its path resolving to
+The list must show `omp-launchpad`, version `0.8.0`, with its path resolving to
 this checkout. Start a fresh OMP process and repeat the read-path smoke tests
 without `--no-extensions -e ./index.ts`:
 
@@ -287,7 +287,7 @@ To return to the published plugin after local testing, install the pinned npm
 package:
 
 ```sh
-omp plugin install omp-launchpad@0.5.2
+omp plugin install omp-launchpad@0.8.0
 ```
 
 ## Bridge-only diagnosis
