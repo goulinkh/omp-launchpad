@@ -100,8 +100,8 @@ status (`statusLine.showHookStatus: false`) remains hidden.
 
 The dedicated tools expose these operations:
 
-- `launchpad`: `resource_view`, `repo_view`, `file_read`, `search_bugs`, `search_merge_proposals`, `merge_proposal_for_branch`, `current_merge_proposal`, `merge_proposal_discussion`, `preview_diffs`, `inline_comments`, `review_drafts`, `diff_line_map`
-- `launchpad_write`: `bug_create`, `merge_proposal_create`, `merge_proposal_edit`, `replace_merge_proposal_prerequisite`, `comment`, `review_draft_update`, `review_submit`, `set_merge_proposal_status`, `merge_proposal_checkout`, `merge_proposal_push`
+- `launchpad`: `resource_view`, `repo_view`, `file_read`, `search_bugs`, `search_merge_proposals`, `merge_proposal_for_branch`, `current_merge_proposal`, `merge_proposal_discussion`, `merge_proposal_bugs`, `preview_diffs`, `inline_comments`, `review_drafts`, `diff_line_map`
+- `launchpad_write`: `bug_create`, `bug_edit`, `bug_task_edit`, `project_edit`, `repository_edit`, `merge_proposal_create`, `merge_proposal_edit`, `replace_merge_proposal_prerequisite`, `merge_proposal_link_bug`, `merge_proposal_unlink_bug`, `comment`, `comment_edit`, `review_draft_update`, `review_submit`, `set_merge_proposal_status`, `merge_proposal_checkout`, `merge_proposal_push`
 
 For `resource_view`, `preview_diff_id` selects that snapshot's diff. The target may be a numeric merge-proposal ID or a merge-proposal URL and does not need a `/diff` suffix.
 
@@ -125,6 +125,18 @@ Show unresolved inline comments on the current diff for lp://~owner/project/+git
 Use launchpad with op merge_proposal_discussion, comments inline, current_diff_only true, reviewer alice, and since 2026-09-01T00:00:00Z.
 
 Use launchpad with op preview_diffs for lp://~owner/project/+git/repository/+merge/123.
+
+Show the bugs linked to lp://~owner/project/+git/repository/+merge/123.
+
+Link bug 456 to lp://~owner/project/+git/repository/+merge/123.
+
+Update the status and importance of the task at lp://project/+bug/456.
+
+Edit a comment at lp://~owner/project/+git/repository/+merge/123/comments/789.
+
+Update the description of the repository at lp://~owner/project/+git/repository.
+
+Update the summary of lp://project.
 
 Create a merge proposal from feature-2 into main with prerequisite_ref feature-1, prerequisite_repository ~owner/project/+git/base, commit_message "Add the dependent feature", wait_for_index true, and wait_for_preview true.
 
@@ -187,15 +199,34 @@ from a new submission. If the outcome remains unknown, inspect the source
 branch's proposals before retrying. This is not an idempotency guarantee for
 older proposals or concurrently identical requests.
 
-`merge_proposal_edit` changes `commit_message` and/or `description` on the
-same proposal via Launchpad's writable fields. It cannot change the source,
-target, or prerequisite refs. Launchpad cannot edit a prerequisite in place:
+`merge_proposal_edit` changes `commit_message`, `description`, and/or
+`reviewed_revid` on the same proposal via Launchpad's writable fields. It
+cannot change the source, target, or prerequisite refs. Launchpad cannot edit
+a prerequisite in place:
 `replace_merge_proposal_prerequisite` creates a new proposal with the
 original source and target, description, and commit message, then marks the
 old proposal Superseded. This changes the URL and does not move comments or
 reviews. If creation fails, the tool attempts to restore the old status and
 reports if restoration also fails. Changing a merge target requires a new
 proposal.
+
+`merge_proposal_bugs` reads linked bugs through Launchpad's authenticated
+collection, even for public proposals. `merge_proposal_link_bug` and
+`merge_proposal_unlink_bug` change that relationship by numeric `bug_id`.
+Proposal output includes source/target repository API links; `repo_view` shows
+the repository's target project link. `resource_view` accepts these API links
+as well as `lp://` and Launchpad web URLs.
+
+`bug_edit` changes the bug's title, description, or tags. Status, importance,
+and assignee belong to an individual bug task: read the bug to find that
+task's URL, then use `bug_task_edit` on that URL. Set `unassign: true` to clear
+the assignee. `project_edit` changes summary, description, reporting
+guidelines, or official bug tags; the tag list replaces all existing tags.
+`repository_edit` changes description or the full `refs/heads/...` default
+branch. `comment_edit` targets an individual bug or proposal comment URL and
+uses Launchpad's revision-preserving `editContent` operation. Launchpad
+permissions still apply to every write; these typed operations do not expose
+unrelated administrative or destructive API methods.
 
 `current_merge_proposal` inspects the working directory, current branch, and
 all Git remotes. It prefers a Launchpad `origin`, otherwise the first Launchpad

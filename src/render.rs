@@ -114,6 +114,16 @@ fn render_proposal_at_level(
     );
     push_bullet(
         &mut lines,
+        "Source repository",
+        scalar_field(proposal, "source_git_repository_link"),
+    );
+    push_bullet(
+        &mut lines,
+        "Target repository",
+        scalar_field(proposal, "target_git_repository_link"),
+    );
+    push_bullet(
+        &mut lines,
         "Prerequisite",
         scalar_field(proposal, "prerequisite_git_path")
             .or_else(|| nested_scalar(proposal, "prerequisite_branch", "unique_name")),
@@ -133,6 +143,11 @@ fn render_proposal_at_level(
         &mut lines,
         "Reviewed",
         scalar_field(proposal, "date_reviewed"),
+    );
+    push_bullet(
+        &mut lines,
+        "Reviewed revision",
+        scalar_field(proposal, "reviewed_revid"),
     );
     push_bullet(&mut lines, "Merged", scalar_field(proposal, "date_merged"));
     push_bullet(&mut lines, "URL", scalar_field(proposal, "web_link"));
@@ -171,6 +186,11 @@ pub fn render_repository(repository: &Value) -> String {
     let mut lines = vec![format!("# {name}")];
     push_bullet(&mut lines, "Owner", person_field(repository, "owner"));
     push_bullet(&mut lines, "Target", person_field(repository, "target"));
+    push_bullet(
+        &mut lines,
+        "Target URL",
+        scalar_field(repository, "target_link"),
+    );
     push_bullet(
         &mut lines,
         "Default branch",
@@ -637,7 +657,10 @@ fn render_bug_task(task: &Value) -> String {
     let assignee = person_field(task, "assignee")
         .map(|assignee| format!(" · assignee: {assignee}"))
         .unwrap_or_default();
-    format!("- **{target}:** {status} · {importance}{assignee}")
+    let url = text_field(task, "web_link")
+        .map(|url| format!(" · {url}"))
+        .unwrap_or_default();
+    format!("- **{target}:** {status} · {importance}{assignee}{url}")
 }
 
 fn render_comment(comment: &Value) -> String {
@@ -661,6 +684,9 @@ fn render_comment(comment: &Value) -> String {
         .or_else(|| text_field(comment, "content"))
         .filter(|body| !body.trim().is_empty());
     let mut lines = vec![heading];
+    if let Some(url) = text_field(comment, "web_link") {
+        lines.push(format!("**URL:** {url}"));
+    }
     if let Some(body) = body {
         if title.is_some_and(|title| compact(title) != compact(body)) {
             lines.push(format!("**{}**", title.unwrap_or_default()));

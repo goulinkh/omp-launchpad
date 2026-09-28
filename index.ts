@@ -167,9 +167,10 @@ export default function launchpadExtension(pi: ExtensionAPI) {
       "Read Launchpad through the bundled lpcli library; no standalone lpcli command is required. Authenticate with " +
       "/launchpad login in OMP. Repository inputs accept Launchpad paths and Git remote URLs. Branch and current " +
       "checkout lookup use explicit proposal selection rules and report the selected proposal and reason. Discussion " +
-      "defaults to a compact review summary; format can request structured data or both. Merge proposal targets accept " +
-      "a full Launchpad URL/path or a numeric ID when the working checkout has a related Launchpad remote. Prefer read " +
-      "with lp:// URLs for individual bugs, merge proposals, and diff text.",
+      "defaults to a compact review summary; format can request structured data or both. Read bugs linked to a proposal " +
+      "with merge_proposal_bugs (requires login). Resource targets accept lp://, Launchpad web/API URLs, or a numeric " +
+      "merge-proposal ID when the working checkout has a related Launchpad remote. Prefer read with lp:// URLs for " +
+      "individual bugs, merge proposals, and diff text.",
     parameters: z.union([
       z.object({
         op: z.literal("resource_view"),
@@ -230,6 +231,7 @@ export default function launchpadExtension(pi: ExtensionAPI) {
         ...proposalSelection,
         ...withIntent,
       }),
+      z.object({ op: z.literal("merge_proposal_bugs"), target: mergeProposalTarget, ...withIntent }),
       z.object({ op: z.literal("preview_diffs"), target: mergeProposalTarget, ...withIntent }),
       z.object({
         op: z.literal("inline_comments"),
@@ -265,8 +267,9 @@ export default function launchpadExtension(pi: ExtensionAPI) {
     label: "Launchpad Write",
     description:
       "Mutate Launchpad or local Git state through the bundled lpcli library; no standalone lpcli command is required. " +
-      "Authenticate with /launchpad login in OMP. Create or replace merge proposals, edit proposal metadata, create bugs, " +
-      "add comments, update inline review drafts, submit reviews, change proposal status, check out or push branches.",
+      "Authenticate with /launchpad login in OMP. Create or replace merge proposals; edit proposal, bug, bug-task, " +
+      "project, and repository metadata; link bugs to proposals; create or edit comments; update inline drafts, " +
+      "submit reviews, change proposal status, and check out or push branches.",
     parameters: z.union([
       z.object({
         op: z.literal("bug_create"),
@@ -277,6 +280,39 @@ export default function launchpadExtension(pi: ExtensionAPI) {
         tags: z.array(z.string()).optional(),
         ...withIntent,
       }),
+      z.object({
+        op: z.literal("bug_edit"),
+        target: z.string(),
+        title: z.string().optional(),
+        description: z.string().optional(),
+        tags: z.array(z.string()).optional(),
+        ...withIntent,
+      }).strict(),
+      z.object({
+        op: z.literal("bug_task_edit"),
+        target: z.string().describe("Bug task URL, e.g. lp://project/+bug/123; read the bug to find its task URL."),
+        status: z.string().optional(),
+        importance: z.string().optional(),
+        assignee: z.string().optional().describe("Launchpad username without ~."),
+        unassign: z.literal(true).optional(),
+        ...withIntent,
+      }).strict(),
+      z.object({
+        op: z.literal("project_edit"),
+        target: z.string(),
+        summary: z.string().optional(),
+        description: z.string().optional(),
+        bug_reporting_guidelines: z.string().optional(),
+        official_bug_tags: z.array(z.string()).optional(),
+        ...withIntent,
+      }).strict(),
+      z.object({
+        op: z.literal("repository_edit"),
+        target: z.string(),
+        description: z.string().optional(),
+        default_branch: z.string().optional(),
+        ...withIntent,
+      }).strict(),
       z.object({
         op: z.literal("merge_proposal_create"),
         repository: z.string(),
@@ -299,8 +335,21 @@ export default function launchpadExtension(pi: ExtensionAPI) {
         target: mergeProposalTarget,
         commit_message: z.string().optional(),
         description: z.string().optional(),
+        reviewed_revid: z.string().optional(),
         ...withIntent,
-      }).strict().describe("Edit commit_message or description on the same proposal. Prerequisites are immutable; use replace_merge_proposal_prerequisite."),
+      }).strict().describe("Edit commit_message, description, or reviewed_revid on the same proposal. Prerequisites are immutable; use replace_merge_proposal_prerequisite."),
+      z.object({
+        op: z.enum(["merge_proposal_link_bug", "merge_proposal_unlink_bug"]),
+        target: mergeProposalTarget,
+        bug_id: positiveInteger,
+        ...withIntent,
+      }),
+      z.object({
+        op: z.literal("comment_edit"),
+        target: z.string().describe("Individual bug or merge-proposal comment URL shown in its parent resource."),
+        body: z.string(),
+        ...withIntent,
+      }),
       z.object({
         op: z.literal("comment"),
         target: mergeProposalTarget,

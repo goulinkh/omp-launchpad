@@ -57,17 +57,26 @@ pub async fn execute(request: &Request) -> Result<OperationResult> {
         Operation::MergeProposalDiscussion => {
             view_merge_proposal_discussion(&client, request).await
         }
+        Operation::MergeProposalBugs => view_merge_proposal_bugs(&client, request).await,
         Operation::PreviewDiffs => view_preview_diffs(&client, request).await,
         Operation::InlineComments => view_inline_comments(&client, request).await,
         Operation::ReviewDrafts => view_review_drafts(&client, request).await,
         Operation::DiffLineMap => map_diff_line(&client, request).await,
         Operation::BugCreate => create_bug(&client, request).await,
+        Operation::BugEdit => edit_bug(&client, request).await,
+        Operation::BugTaskEdit => edit_bug_task(&client, request).await,
+        Operation::ProjectEdit => edit_project(&client, request).await,
+        Operation::RepositoryEdit => edit_repository(&client, request).await,
         Operation::MergeProposalCreate => create_merge_proposal(&client, request).await,
         Operation::MergeProposalEdit => edit_merge_proposal(&client, request).await,
         Operation::ReplaceMergeProposalPrerequisite => {
             replace_merge_proposal_prerequisite(&client, request).await
         }
+        Operation::MergeProposalLinkBug | Operation::MergeProposalUnlinkBug => {
+            change_merge_proposal_bug_link(&client, request).await
+        }
         Operation::Comment => add_comment(&client, request).await,
+        Operation::CommentEdit => edit_comment(&client, request).await,
         Operation::ReviewDraftUpdate => update_review_draft(&client, request).await,
         Operation::ReviewSubmit => submit_review(&client, request).await,
         Operation::SetMergeProposalStatus => set_merge_proposal_status(&client, request).await,
@@ -282,6 +291,32 @@ async fn view_merge_proposal_value(
     );
     let details = proposal_details(client, &proposal).await?;
     Ok(OperationResult::new(text)
+        .with_source_url(source_url)
+        .with_details(details))
+}
+
+async fn view_merge_proposal_bugs(
+    client: &LaunchpadClient,
+    request: &Request,
+) -> Result<OperationResult> {
+    let (_, proposal) = request_merge_proposal(client, request).await?;
+    let collection = render::text_field(&proposal, "bugs_collection_link")
+        .ok_or_else(|| Error::invalid("merge proposal has no bugs collection"))?;
+    let bugs = fetch_all_entries(client, collection).await?;
+    let id = render::resource_id(&proposal).unwrap_or_else(|| "?".to_owned());
+    let mut lines = vec![format!("# Bugs linked to merge proposal {id}")];
+    for bug in &bugs {
+        let bug_id = render::scalar_field(bug, "id").unwrap_or_else(|| "?".to_owned());
+        let title = render::text_field(bug, "title").unwrap_or("Untitled");
+        let url = render::text_field(bug, "web_link").unwrap_or_default();
+        lines.push(format!("- [#{bug_id}: {title}]({url})"));
+    }
+    if bugs.is_empty() {
+        lines.push("No linked bugs.".to_owned());
+    }
+    let source_url = render::text_field(&proposal, "web_link").map(str::to_owned);
+    let details = json!({ "kind": "branch_merge_proposal_bugs", "proposal_id": id, "bugs": bugs });
+    Ok(OperationResult::new(lines.join("\n"))
         .with_source_url(source_url)
         .with_details(details))
 }
@@ -1675,6 +1710,140 @@ async fn create_bug(client: &LaunchpadClient, request: &Request) -> Result<Opera
         .with_details(details))
 }
 
+async fn edit_bug(client: &LaunchpadClient, request: &Request) -> Result<OperationResult> {
+    let target = ResourceTarget::parse(request.target()?)?;
+    if !matches!(target.kind, ResourceKind::Bug { .. }) {
+        return Err(Error::invalid("bug_edit requires a bug URL"));
+    }
+    let url = client.url(&format!("/{}", target.path));
+    let mut changes = serde_json::Map::new();
+    if let Some(title) = &request.title {
+        changes.insert("title".to_owned(), json!(title));
+    }
+    if let Some(description) = &request.description {
+        changes.insert("description".to_owned(), json!(description));
+    }
+    if let Some(tags) = &request.tags {
+        changes.insert("tags".to_owned(), json!(tags));
+    }
+    let updated: Value = client
+        .patch_url_with_value(&url, &Value::Object(changes))
+        .await?;
+    let source_url = render::text_field(&updated, "web_link").map(str::to_owned);
+    let text = format!(
+        "# Updated Launchpad bug\n\n{}",
+        render::render_bug(&updated, &[], &[], false, 1)
+    );
+    Ok(OperationResult::new(text)
+        .with_source_url(source_url)
+        .with_details(json!({ "kind": "bug", "id": updated.get("id") })))
+}
+
+async fn edit_bug_task(client: &LaunchpadClient, request: &Request) -> Result<OperationResult> {
+    let target = ResourceTarget::parse(request.target()?)?;
+    let url = client.url(&format!("/{}", target.path));
+    let task: Value = client.get_url(&url).await?;
+    if resource_kind(&task) != "bug_task" {
+        return Err(Error::invalid("bug_task_edit requires a bug task URL"));
+    }
+    let mut changes = serde_json::Map::new();
+    if let Some(status) = &request.status {
+        let OneOrMany::One(status) = status else {
+            return Err(Error::invalid("status must be a string"));
+        };
+        changes.insert("status".to_owned(), json!(status));
+    }
+    if let Some(importance) = &request.importance {
+        let OneOrMany::One(importance) = importance else {
+            return Err(Error::invalid("importance must be a string"));
+        };
+        changes.insert("importance".to_owned(), json!(importance));
+    }
+    if let Some(assignee) = &request.assignee {
+        changes.insert(
+            "assignee_link".to_owned(),
+            json!(client.url(&format!("/~{assignee}"))),
+        );
+    }
+    if request.unassign == Some(true) {
+        changes.insert("assignee_link".to_owned(), Value::Null);
+    }
+    let updated: Value = client
+        .patch_url_with_value(&url, &Value::Object(changes))
+        .await?;
+    let source_url = render::text_field(&updated, "web_link").map(str::to_owned);
+    let text = format!(
+        "# Updated Launchpad bug task\n\n{}",
+        render::render_generic(&updated)
+    );
+    Ok(OperationResult::new(text)
+        .with_source_url(source_url)
+        .with_details(json!({ "kind": "bug_task", "target": target.path })))
+}
+
+async fn edit_project(client: &LaunchpadClient, request: &Request) -> Result<OperationResult> {
+    let target = ResourceTarget::parse(request.target()?)?;
+    let url = client.url(&format!("/{}", target.path));
+    let project: Value = client.get_url(&url).await?;
+    if resource_kind(&project) != "project" {
+        return Err(Error::invalid("project_edit requires a project URL"));
+    }
+    let mut changes = serde_json::Map::new();
+    if let Some(summary) = &request.summary {
+        changes.insert("summary".to_owned(), json!(summary));
+    }
+    if let Some(description) = &request.description {
+        changes.insert("description".to_owned(), json!(description));
+    }
+    if let Some(guidelines) = &request.bug_reporting_guidelines {
+        changes.insert("bug_reporting_guidelines".to_owned(), json!(guidelines));
+    }
+    if let Some(tags) = &request.official_bug_tags {
+        changes.insert("official_bug_tags".to_owned(), json!(tags));
+    }
+    let updated: Value = client
+        .patch_url_with_value(&url, &Value::Object(changes))
+        .await?;
+    let source_url = render::text_field(&updated, "web_link").map(str::to_owned);
+    let text = format!(
+        "# Updated Launchpad project\n\n{}",
+        render::render_generic(&updated)
+    );
+    Ok(OperationResult::new(text)
+        .with_source_url(source_url)
+        .with_details(json!({ "kind": "project", "target": target.path })))
+}
+
+async fn edit_repository(client: &LaunchpadClient, request: &Request) -> Result<OperationResult> {
+    let target = ResourceTarget::parse(request.target()?)?;
+    if !matches!(target.kind, ResourceKind::Repository) {
+        return Err(Error::invalid(
+            "repository_edit requires a Git repository URL",
+        ));
+    }
+    let repository = get_repository(client, &target.path).await?;
+    let url = render::text_field(&repository, "self_link")
+        .ok_or_else(|| Error::invalid("repository has no API link"))?;
+    let mut changes = serde_json::Map::new();
+    if let Some(description) = &request.description {
+        changes.insert("description".to_owned(), json!(description));
+    }
+    if let Some(branch) = &request.default_branch {
+        changes.insert("default_branch".to_owned(), json!(branch));
+    }
+    let updated: Value = client
+        .patch_url_with_value(url, &Value::Object(changes))
+        .await?;
+    let source_url = render::text_field(&updated, "web_link").map(str::to_owned);
+    let text = format!(
+        "# Updated Launchpad Git repository\n\n{}",
+        render::render_repository(&updated)
+    );
+    Ok(OperationResult::new(text)
+        .with_source_url(source_url)
+        .with_details(json!({ "kind": "git_repository", "target": target.path })))
+}
+
 struct PreparedMergeProposal {
     source_link: String,
     target_link: String,
@@ -2015,6 +2184,9 @@ async fn edit_merge_proposal(
     if let Some(description) = request.description.as_deref() {
         changes.insert("description".to_owned(), json!(description));
     }
+    if let Some(revid) = request.reviewed_revid.as_deref() {
+        changes.insert("reviewed_revid".to_owned(), json!(revid));
+    }
     let updated: Value = client
         .patch_url_with_value(url.as_str(), &Value::Object(changes))
         .await
@@ -2131,6 +2303,36 @@ async fn replace_merge_proposal_prerequisite(
         .with_details(details))
 }
 
+async fn change_merge_proposal_bug_link(
+    client: &LaunchpadClient,
+    request: &Request,
+) -> Result<OperationResult> {
+    let (_, proposal) = request_merge_proposal(client, request).await?;
+    let url = proposal_api_url(&proposal)?;
+    let bug_id = request
+        .bug_id
+        .filter(|id| *id > 0)
+        .ok_or_else(|| Error::invalid("bug_id must be a positive bug ID"))?;
+    let bug_link = client.url(&format!("/bugs/{bug_id}"));
+    let (operation, verb) = match request.op {
+        Operation::MergeProposalLinkBug => ("linkBug", "linked to"),
+        Operation::MergeProposalUnlinkBug => ("unlinkBug", "unlinked from"),
+        _ => return Err(Error::invalid("invalid merge proposal bug link operation")),
+    };
+    client
+        .post_pairs_url_ok(url.as_str(), &[("ws.op", operation), ("bug", &bug_link)])
+        .await?;
+    let source_url = render::text_field(&proposal, "web_link").map(str::to_owned);
+    let id = render::resource_id(&proposal).unwrap_or_else(|| "?".to_owned());
+    Ok(
+        OperationResult::new(format!("Bug #{bug_id} {verb} merge proposal {id}"))
+            .with_source_url(source_url)
+            .with_details(
+                json!({ "kind": "branch_merge_proposal", "proposal_id": id, "bug_id": bug_id }),
+            ),
+    )
+}
+
 async fn add_comment(client: &LaunchpadClient, request: &Request) -> Result<OperationResult> {
     let target = ResourceTarget::parse(request.target()?)?;
     let body = request.string(&request.body, "body")?;
@@ -2173,6 +2375,38 @@ async fn add_comment(client: &LaunchpadClient, request: &Request) -> Result<Oper
     Ok(OperationResult::new(text)
         .with_source_url(Some(source_url))
         .with_details(details))
+}
+
+async fn edit_comment(client: &LaunchpadClient, request: &Request) -> Result<OperationResult> {
+    let target = ResourceTarget::parse(request.target()?)?;
+    let url = client.url(&format!("/{}", target.path));
+    let comment: Value = client.get_url(&url).await?;
+    if !matches!(
+        resource_kind(&comment).as_str(),
+        "code_review_comment" | "message"
+    ) {
+        return Err(Error::invalid(
+            "comment_edit requires an individual bug or merge-proposal comment URL",
+        ));
+    }
+    let comment_url = render::text_field(&comment, "self_link")
+        .ok_or_else(|| Error::invalid("comment has no API link"))?;
+    let body = request.string(&request.body, "body")?;
+    client
+        .post_pairs_url_ok(
+            comment_url,
+            &[("ws.op", "editContent"), ("new_content", body)],
+        )
+        .await?;
+    let updated: Value = client.get_url(comment_url).await?;
+    let source_url = render::text_field(&updated, "web_link").map(str::to_owned);
+    let text = format!(
+        "# Updated Launchpad comment\n\n{}",
+        render::render_generic(&updated)
+    );
+    Ok(OperationResult::new(text)
+        .with_source_url(source_url)
+        .with_details(json!({ "kind": resource_kind(&updated), "target": target.path })))
 }
 
 async fn update_review_draft(
@@ -3006,12 +3240,15 @@ async fn proposal_details(client: &LaunchpadClient, proposal: &Value) -> Result<
         "id": render::resource_id(proposal),
         "url": render::scalar_field(proposal, "web_link"),
         "status": render::scalar_field(proposal, "queue_status"),
+        "reviewed_revid": render::scalar_field(proposal, "reviewed_revid"),
         "source_ref": render::scalar_field(proposal, "source_git_path"),
         "target_ref": render::scalar_field(proposal, "target_git_path"),
         "prerequisite_ref": render::scalar_field(proposal, "prerequisite_git_path"),
         "prerequisite_repository": prerequisite_repository.as_ref().and_then(|repository| render::scalar_field(repository, "unique_name")),
         "source_repository": render::scalar_field(&source_repository, "unique_name"),
         "target_repository": render::scalar_field(&target_repository, "unique_name"),
+        "source_repository_target_link": render::scalar_field(&source_repository, "target_link"),
+        "target_repository_target_link": render::scalar_field(&target_repository, "target_link"),
         "source_https_url": render::scalar_field(&source_repository, "git_https_url"),
         "source_ssh_url": render::scalar_field(&source_repository, "git_ssh_url"),
         "target_https_url": render::scalar_field(&target_repository, "git_https_url"),
@@ -4352,5 +4589,301 @@ mod tests {
             result.source_url.as_deref(),
             Some("https://code.launchpad.net/~owner/project/+git/repo/+merge/42")
         );
+    }
+    #[tokio::test]
+    async fn linked_bugs_can_be_read_and_updated_from_a_proposal() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let base = format!("http://{address}/devel");
+        let proposal_path = "/devel/~owner/project/+git/repo/+merge/42";
+        let bugs_path = format!("{proposal_path}/bugs");
+        let proposal = json!({
+            "self_link": format!("{base}/~owner/project/+git/repo/+merge/42"),
+            "web_link": "https://code.launchpad.net/~owner/project/+git/repo/+merge/42",
+            "bugs_collection_link": format!("{base}/~owner/project/+git/repo/+merge/42/bugs")
+        });
+        let server = tokio::spawn(async move {
+            for expected in ["GET", "GET", "GET", "POST"] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (headers, body) = read_http_request(&mut stream).await;
+                let mut words = headers.split_ascii_whitespace();
+                let method = words.next().unwrap();
+                let path = words.next().unwrap();
+                assert_eq!(method, expected);
+                let response = match (method, path) {
+                    ("GET", p) if p == proposal_path => proposal.clone(),
+                    ("GET", p) if p == bugs_path => json!({
+                        "start": 0, "total_size": 1,
+                        "entries": [{
+                            "id": 17,
+                            "title": "Fix the failing migration",
+                            "web_link": "https://bugs.launchpad.net/bugs/17"
+                        }]
+                    }),
+                    ("POST", p) if p == proposal_path => {
+                        let fields: HashMap<_, _> = url::form_urlencoded::parse(body.as_bytes())
+                            .into_owned()
+                            .collect();
+                        assert_eq!(fields["ws.op"], "linkBug");
+                        assert_eq!(fields["bug"], format!("http://{address}/devel/bugs/17"));
+                        json!({})
+                    }
+                    _ => panic!("unexpected request: {method} {path}"),
+                };
+                let body = response.to_string();
+                stream
+                    .write_all(format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    ).as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let client = LaunchpadClient::new(None).with_base_url(base);
+        let target = "lp://~owner/project/+git/repo/+merge/42";
+        let read: Request = serde_json::from_value(json!({
+            "op": "merge_proposal_bugs", "target": target
+        }))
+        .unwrap();
+        read.validate().unwrap();
+        let result = super::view_merge_proposal_bugs(&client, &read)
+            .await
+            .unwrap();
+        assert!(result.text.contains("#17: Fix the failing migration"));
+        let link: Request = serde_json::from_value(json!({
+            "op": "merge_proposal_link_bug", "target": target, "bug_id": 17
+        }))
+        .unwrap();
+        link.validate().unwrap();
+        let result = super::change_merge_proposal_bug_link(&client, &link)
+            .await
+            .unwrap();
+        assert!(result.text.contains("Bug #17 linked to merge proposal 42"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bug_task_edit_changes_the_selected_task_not_the_parent_bug() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let base = format!("http://{address}/devel");
+        let server = tokio::spawn(async move {
+            for expected in ["GET", "PATCH"] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (headers, body) = read_http_request(&mut stream).await;
+                let mut words = headers.split_ascii_whitespace();
+                let method = words.next().unwrap();
+                let path = words.next().unwrap();
+                assert_eq!((method, path), (expected, "/devel/project/+bug/42"));
+                if method == "PATCH" {
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&body).unwrap(),
+                        json!({
+                            "status": "Triaged",
+                            "importance": "High",
+                            "assignee_link": format!("http://{address}/devel/~alice")
+                        })
+                    );
+                }
+                let response = json!({
+                    "resource_type_link": "https://api.launchpad.net/devel/#bug_task",
+                    "web_link": "https://bugs.launchpad.net/project/+bug/42",
+                    "status": if method == "PATCH" { "Triaged" } else { "New" },
+                    "importance": if method == "PATCH" { "High" } else { "Undecided" }
+                });
+                let body = response.to_string();
+                stream
+                    .write_all(format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    ).as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let client = LaunchpadClient::new(None).with_base_url(base);
+        let request: Request = serde_json::from_value(json!({
+            "op": "bug_task_edit",
+            "target": "lp://project/+bug/42",
+            "status": "Triaged",
+            "importance": "High",
+            "assignee": "alice"
+        }))
+        .unwrap();
+        request.validate().unwrap();
+        let result = super::edit_bug_task(&client, &request).await.unwrap();
+        assert!(result.text.contains("Triaged"));
+        assert!(result.text.contains("High"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn editing_a_comment_uses_its_own_resource_and_returns_new_content() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let base = format!("http://{address}/devel");
+        let server_base = base.clone();
+        let server = tokio::spawn(async move {
+            let mut edited = false;
+            for expected in ["GET", "POST", "GET"] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (headers, body) = read_http_request(&mut stream).await;
+                let mut words = headers.split_ascii_whitespace();
+                let method = words.next().unwrap();
+                let path = words.next().unwrap();
+                assert_eq!(
+                    (method, path),
+                    (
+                        expected,
+                        "/devel/~owner/project/+git/repo/+merge/42/comments/7"
+                    )
+                );
+                if method == "POST" {
+                    let fields: HashMap<_, _> = url::form_urlencoded::parse(body.as_bytes())
+                        .into_owned()
+                        .collect();
+                    assert_eq!(fields["ws.op"], "editContent");
+                    assert_eq!(fields["new_content"], "Corrected analysis");
+                    edited = true;
+                }
+                let response = json!({
+                    "self_link": format!("{server_base}/~owner/project/+git/repo/+merge/42/comments/7"),
+                    "web_link": "https://code.launchpad.net/~owner/project/+git/repo/+merge/42/comments/7",
+                    "resource_type_link": "https://api.launchpad.net/devel/#code_review_comment",
+                    "content": if edited { "Corrected analysis" } else { "Earlier analysis" }
+                });
+                let body = response.to_string();
+                stream
+                    .write_all(format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    ).as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let client = LaunchpadClient::new(None).with_base_url(base);
+        let request: Request = serde_json::from_value(json!({
+            "op": "comment_edit",
+            "target": "lp://~owner/project/+git/repo/+merge/42/comments/7",
+            "body": "Corrected analysis"
+        }))
+        .unwrap();
+        request.validate().unwrap();
+        let result = super::edit_comment(&client, &request).await.unwrap();
+        assert!(result.text.contains("Corrected analysis"));
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn metadata_edits_target_the_bug_project_and_repository() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let base = format!("http://{address}/devel");
+        let repo_path = "/devel/~owner/project/+git/repo";
+        let repo_link = format!("{base}/~owner/project/+git/repo");
+        let server = tokio::spawn(async move {
+            let mut bug = json!({
+                "id": 17, "title": "Old title", "description": "Existing description",
+                "web_link": "https://bugs.launchpad.net/bugs/17"
+            });
+            let mut project = json!({
+                "resource_type_link": "https://api.launchpad.net/devel/#project",
+                "summary": "Old summary", "name": "project"
+            });
+            let mut repository = json!({
+                "self_link": repo_link, "unique_name": "~owner/project/+git/repo",
+                "default_branch": "refs/heads/master"
+            });
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (headers, body) = read_http_request(&mut stream).await;
+                let mut words = headers.split_ascii_whitespace();
+                let method = words.next().unwrap();
+                let path = words.next().unwrap();
+                let response = match (method, path) {
+                    ("PATCH", "/devel/bugs/17") => {
+                        assert_eq!(
+                            serde_json::from_str::<Value>(&body).unwrap(),
+                            json!({"title": "New title"})
+                        );
+                        bug["title"] = json!("New title");
+                        bug.clone()
+                    }
+                    ("GET", "/devel/project") => project.clone(),
+                    ("PATCH", "/devel/project") => {
+                        assert_eq!(
+                            serde_json::from_str::<Value>(&body).unwrap(),
+                            json!({"summary": "New summary"})
+                        );
+                        project["summary"] = json!("New summary");
+                        project.clone()
+                    }
+                    ("GET", path) if path.starts_with("/devel/+git?") => {
+                        let url = Url::parse(&format!("http://{address}{path}")).unwrap();
+                        assert!(url.query_pairs().any(
+                            |(key, value)| key == "path" && value == "~owner/project/+git/repo"
+                        ));
+                        repository.clone()
+                    }
+                    ("PATCH", path) if path == repo_path => {
+                        assert_eq!(
+                            serde_json::from_str::<Value>(&body).unwrap(),
+                            json!({"default_branch": "refs/heads/main"})
+                        );
+                        repository["default_branch"] = json!("refs/heads/main");
+                        repository.clone()
+                    }
+                    _ => panic!("unexpected request: {method} {path}"),
+                };
+                let body = response.to_string();
+                stream
+                    .write_all(format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    ).as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let client = LaunchpadClient::new(None).with_base_url(base);
+        let bug: Request = serde_json::from_value(json!({
+            "op": "bug_edit", "target": "lp://bugs/17", "title": "New title"
+        }))
+        .unwrap();
+        bug.validate().unwrap();
+        assert!(
+            super::edit_bug(&client, &bug)
+                .await
+                .unwrap()
+                .text
+                .contains("New title")
+        );
+        let project: Request = serde_json::from_value(json!({
+            "op": "project_edit", "target": "lp://project", "summary": "New summary"
+        }))
+        .unwrap();
+        project.validate().unwrap();
+        assert!(
+            super::edit_project(&client, &project)
+                .await
+                .unwrap()
+                .text
+                .contains("New summary")
+        );
+        let repository: Request = serde_json::from_value(json!({
+            "op": "repository_edit", "target": "lp://~owner/project/+git/repo",
+            "default_branch": "refs/heads/main"
+        }))
+        .unwrap();
+        repository.validate().unwrap();
+        assert!(
+            super::edit_repository(&client, &repository)
+                .await
+                .unwrap()
+                .text
+                .contains("refs/heads/main")
+        );
+        server.await.unwrap();
     }
 }

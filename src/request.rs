@@ -31,15 +31,23 @@ pub enum Operation {
     MergeProposalForBranch,
     CurrentMergeProposal,
     MergeProposalDiscussion,
+    MergeProposalBugs,
     PreviewDiffs,
     InlineComments,
     ReviewDrafts,
     DiffLineMap,
     BugCreate,
+    BugEdit,
+    BugTaskEdit,
+    ProjectEdit,
+    RepositoryEdit,
     MergeProposalCreate,
     MergeProposalEdit,
     ReplaceMergeProposalPrerequisite,
+    MergeProposalLinkBug,
+    MergeProposalUnlinkBug,
     Comment,
+    CommentEdit,
     ReviewDraftUpdate,
     ReviewSubmit,
     SetMergeProposalStatus,
@@ -52,11 +60,19 @@ impl Operation {
         matches!(
             self,
             Self::ReviewDrafts
+                | Self::MergeProposalBugs
                 | Self::BugCreate
+                | Self::BugEdit
+                | Self::BugTaskEdit
+                | Self::ProjectEdit
+                | Self::RepositoryEdit
                 | Self::MergeProposalCreate
                 | Self::MergeProposalEdit
                 | Self::ReplaceMergeProposalPrerequisite
+                | Self::MergeProposalLinkBug
+                | Self::MergeProposalUnlinkBug
                 | Self::Comment
+                | Self::CommentEdit
                 | Self::ReviewDraftUpdate
                 | Self::ReviewSubmit
                 | Self::SetMergeProposalStatus
@@ -151,6 +167,13 @@ pub struct Request {
     pub file_line: Option<u64>,
     pub side: Option<DiffSide>,
     pub title: Option<String>,
+    pub summary: Option<String>,
+    pub bug_reporting_guidelines: Option<String>,
+    pub official_bug_tags: Option<Vec<String>>,
+    pub default_branch: Option<String>,
+    pub assignee: Option<String>,
+    pub unassign: Option<bool>,
+    pub bug_id: Option<u64>,
     pub description: Option<String>,
     pub information_type: Option<String>,
     pub source_ref: Option<String>,
@@ -163,6 +186,7 @@ pub struct Request {
     pub wait_for_preview: Option<bool>,
     pub preview_timeout_seconds: Option<u64>,
     pub commit_message: Option<String>,
+    pub reviewed_revid: Option<String>,
     pub needs_review: Option<bool>,
     pub body: Option<String>,
     pub subject: Option<String>,
@@ -182,6 +206,16 @@ impl Request {
             Operation::MergeProposalForBranch
             | Operation::CurrentMergeProposal
             | Operation::MergeProposalDiscussion => &[],
+            Operation::MergeProposalBugs
+            | Operation::MergeProposalLinkBug
+            | Operation::MergeProposalUnlinkBug
+            | Operation::MergeProposalEdit
+            | Operation::BugEdit
+            | Operation::BugTaskEdit
+            | Operation::ProjectEdit
+            | Operation::RepositoryEdit
+            | Operation::SetMergeProposalStatus
+            | Operation::MergeProposalCheckout => &[("target", &self.target)],
             Operation::PreviewDiffs
             | Operation::InlineComments
             | Operation::ReviewDrafts
@@ -204,10 +238,9 @@ impl Request {
                 ("target", &self.target),
                 ("merge_prerequisite", &self.merge_prerequisite),
             ],
-            Operation::MergeProposalEdit => &[("target", &self.target)],
-            Operation::Comment => &[("target", &self.target), ("body", &self.body)],
-            Operation::SetMergeProposalStatus => &[("target", &self.target)],
-            Operation::MergeProposalCheckout => &[("target", &self.target)],
+            Operation::Comment | Operation::CommentEdit => {
+                &[("target", &self.target), ("body", &self.body)]
+            }
             Operation::MergeProposalPush => &[],
         };
         match self.op {
@@ -304,10 +337,79 @@ impl Request {
         if self.op == Operation::MergeProposalEdit
             && self.commit_message.is_none()
             && self.description.is_none()
+            && self.reviewed_revid.is_none()
         {
             return Err(Error::invalid(
-                "merge_proposal_edit requires commit_message or description",
+                "merge_proposal_edit requires commit_message, description, or reviewed_revid",
             ));
+        }
+        let has_changes = match self.op {
+            Operation::BugEdit => {
+                Some(self.title.is_some() || self.description.is_some() || self.tags.is_some())
+            }
+            Operation::BugTaskEdit => Some(
+                self.status.is_some()
+                    || self.importance.is_some()
+                    || self.assignee.is_some()
+                    || self.unassign == Some(true),
+            ),
+            Operation::ProjectEdit => Some(
+                self.summary.is_some()
+                    || self.description.is_some()
+                    || self.bug_reporting_guidelines.is_some()
+                    || self.official_bug_tags.is_some(),
+            ),
+            Operation::RepositoryEdit => {
+                Some(self.description.is_some() || self.default_branch.is_some())
+            }
+            _ => None,
+        };
+        if has_changes == Some(false) {
+            return Err(Error::invalid(format!(
+                "{:?} requires at least one field to edit",
+                self.op
+            )));
+        }
+        if matches!(
+            self.op,
+            Operation::MergeProposalLinkBug | Operation::MergeProposalUnlinkBug
+        ) && self.bug_id.is_none_or(|id| id == 0)
+        {
+            return Err(Error::invalid("bug_id must be a positive bug ID"));
+        }
+        if self.op == Operation::BugTaskEdit {
+            if self.status.is_some() {
+                self.status()?;
+            }
+            if self.importance.as_ref().is_some_and(|importance| {
+                !matches!(importance, OneOrMany::One(value) if !value.trim().is_empty())
+            }) {
+                return Err(Error::invalid("importance must be a nonempty string"));
+            }
+            if self.assignee.is_some() && self.unassign == Some(true) {
+                return Err(Error::invalid(
+                    "assignee and unassign cannot be used together",
+                ));
+            }
+            if self.unassign == Some(false) {
+                return Err(Error::invalid("unassign must be true when specified"));
+            }
+            if let Some(assignee) = self.assignee.as_deref() {
+                if assignee.is_empty()
+                    || !assignee.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'+' | b'.' | b'_')
+                    })
+                {
+                    return Err(Error::invalid("assignee must be a Launchpad username"));
+                }
+            }
+        }
+        if let Some(branch) = self.default_branch.as_deref() {
+            if !branch.starts_with("refs/heads/") || branch == "refs/heads/" {
+                return Err(Error::invalid(
+                    "default_branch must be a full refs/heads/ Git ref",
+                ));
+            }
         }
         if self.commit_message.is_some()
             && matches!(
@@ -735,11 +837,27 @@ fn split_target(raw: &str) -> Result<(String, Vec<(String, String)>)> {
             }
         } else if !matches!(
             url.host_str(),
-            Some("launchpad.net" | "bugs.launchpad.net" | "code.launchpad.net")
+            Some(
+                "launchpad.net"
+                    | "bugs.launchpad.net"
+                    | "code.launchpad.net"
+                    | "api.launchpad.net"
+                    | "api.staging.launchpad.net"
+                    | "api.qastaging.launchpad.net"
+            )
         ) {
             return Err(Error::invalid("target URL is not a Launchpad URL"));
         }
         let url_path = url.path().trim_start_matches('/');
+        let url_path = if url.host_str().is_some_and(|host| host.starts_with("api.")) {
+            url_path
+                .split_once('/')
+                .map(|(_, resource)| resource)
+                .filter(|resource| !resource.is_empty())
+                .ok_or_else(|| Error::invalid("API target URL has no resource path"))?
+        } else {
+            url_path
+        };
         if !path.is_empty() && !url_path.is_empty() {
             path.push('/');
         }
@@ -791,6 +909,12 @@ fn normalise_bug_path(path: String) -> String {
 }
 
 fn classify_resource(path: &str) -> Result<ResourceKind> {
+    if let Some((_, comment_id)) = path.rsplit_once("/comments/") {
+        comment_id
+            .parse::<u64>()
+            .map_err(|_| Error::invalid("comment target must end with a numeric ID"))?;
+        return Ok(ResourceKind::Generic);
+    }
     if let Some(id) = path.strip_prefix("bugs/") {
         let id = id
             .parse()
@@ -1177,6 +1301,39 @@ mod tests {
         .unwrap();
         request.validate().unwrap();
         assert_eq!(request.limit(), 100);
+    }
+
+    #[test]
+    fn comment_urls_are_resources_not_merge_proposals_or_bugs() {
+        for url in [
+            "lp://~owner/project/+git/repository/+merge/42/comments/1392995",
+            "https://bugs.launchpad.net/ubuntu/+bug/1/comments/0",
+            "https://api.launchpad.net/devel/~owner/project/+git/repository/+merge/42/comments/1392995",
+        ] {
+            let target = ResourceTarget::parse(url).unwrap();
+            assert_eq!(target.kind, ResourceKind::Generic);
+        }
+        let project = ResourceTarget::parse("https://api.launchpad.net/devel/project").unwrap();
+        assert_eq!(project.path, "project");
+    }
+
+    #[test]
+    fn task_edit_rejects_ambiguous_assignee_changes() {
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "op": "bug_task_edit",
+            "target": "lp://project/+bug/42",
+            "status": "Triaged",
+            "assignee": "alice",
+            "unassign": true
+        }))
+        .unwrap();
+        assert!(
+            request
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("assignee and unassign")
+        );
     }
 
     #[test]

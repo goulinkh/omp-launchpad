@@ -204,6 +204,20 @@ Expected heading:
 Set `format` to `structured` to return JSON only, or `both` to return the
 compact summary followed by the full JSON discussion.
 
+Test the linked-bug read operation after `/launchpad login`; Launchpad rejects
+anonymous access to this collection even for a public proposal:
+
+```sh
+omp -p --no-session --auto-approve --no-extensions -e ./index.ts \
+  'Use launchpad exactly once with op merge_proposal_bugs and target lp://~finnrg/launchpad/+git/launchpad/+merge/511704. Then print only the first heading.'
+```
+
+Expected heading:
+
+```text
+# Bugs linked to merge proposal 511704
+```
+
 Test repository file transport:
 
 ```sh
@@ -229,10 +243,11 @@ Expected heading:
 # Checked out Launchpad merge proposal 500054
 ```
 
-Never smoke-test `bug_create`, `merge_proposal_create`, `comment`,
-`set_merge_proposal_status`, or `merge_proposal_push` against production
-merely to prove wiring. Use an expendable resource or a non-production
-Launchpad instance:
+Never smoke-test Launchpad mutations (`bug_edit`, `bug_task_edit`,
+`project_edit`, `repository_edit`, bug linking, comments, reviews, or proposal
+updates) against production merely to prove wiring. Do not smoke-test
+`merge_proposal_push` against a production branch either. Use an expendable
+resource or a non-production Launchpad instance:
 
 ```sh
 OMP_LAUNCHPAD_INSTANCE=staging omp --no-extensions -e ./index.ts
