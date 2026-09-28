@@ -156,6 +156,12 @@ pub struct Request {
     pub source_ref: Option<String>,
     pub target_ref: Option<String>,
     pub merge_prerequisite: Option<String>,
+    pub prerequisite_ref: Option<String>,
+    pub prerequisite_repository: Option<String>,
+    pub wait_for_index: Option<bool>,
+    pub index_timeout_seconds: Option<u64>,
+    pub wait_for_preview: Option<bool>,
+    pub preview_timeout_seconds: Option<u64>,
     pub commit_message: Option<String>,
     pub needs_review: Option<bool>,
     pub body: Option<String>,
@@ -245,17 +251,55 @@ impl Request {
             validate_repository_path(self.path("path")?)?;
         }
         if let Some(prerequisite) = self.merge_prerequisite.as_deref() {
-            if !matches!(
-                self.op,
-                Operation::MergeProposalCreate | Operation::ReplaceMergeProposalPrerequisite
-            ) {
+            if self.op != Operation::ReplaceMergeProposalPrerequisite {
                 return Err(Error::invalid(
-                    "merge_prerequisite is supported only for proposal creation or replacement",
+                    "merge_prerequisite is supported only for proposal replacement; use prerequisite_ref for creation",
                 ));
             }
             if prerequisite.trim().is_empty() {
                 return Err(Error::invalid("merge_prerequisite cannot be empty"));
             }
+        }
+        if self.op == Operation::MergeProposalCreate {
+            if self
+                .prerequisite_ref
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                return Err(Error::invalid("prerequisite_ref cannot be empty"));
+            }
+            if let Some(repository) = self.prerequisite_repository.as_deref() {
+                if repository.trim().is_empty() {
+                    return Err(Error::invalid("prerequisite_repository cannot be empty"));
+                }
+                if self.prerequisite_ref.is_none() {
+                    return Err(Error::invalid(
+                        "prerequisite_repository requires prerequisite_ref",
+                    ));
+                }
+            }
+            validate_creation_timeout(
+                self.index_timeout_seconds,
+                self.wait_for_index,
+                "index_timeout_seconds",
+                "wait_for_index",
+            )?;
+            validate_creation_timeout(
+                self.preview_timeout_seconds,
+                self.wait_for_preview,
+                "preview_timeout_seconds",
+                "wait_for_preview",
+            )?;
+        } else if self.prerequisite_ref.is_some()
+            || self.prerequisite_repository.is_some()
+            || self.wait_for_index.is_some()
+            || self.index_timeout_seconds.is_some()
+            || self.wait_for_preview.is_some()
+            || self.preview_timeout_seconds.is_some()
+        {
+            return Err(Error::invalid(
+                "prerequisite_ref, prerequisite_repository, and indexing/preview waits are supported only for merge_proposal_create",
+            ));
         }
         if self.op == Operation::MergeProposalEdit
             && self.commit_message.is_none()
@@ -501,6 +545,27 @@ impl Request {
             "repository and branch must be provided together; omit both to infer them from the current Git checkout",
         ))
     }
+}
+
+fn validate_creation_timeout(
+    timeout: Option<u64>,
+    wait: Option<bool>,
+    timeout_name: &str,
+    wait_name: &str,
+) -> Result<()> {
+    if let Some(seconds) = timeout {
+        if wait != Some(true) {
+            return Err(Error::invalid(format!(
+                "{timeout_name} requires {wait_name}: true"
+            )));
+        }
+        if !(1..=300).contains(&seconds) {
+            return Err(Error::invalid(format!(
+                "{timeout_name} must be between 1 and 300 seconds"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn normalise_repository(raw: &str) -> Result<String> {
@@ -949,6 +1014,134 @@ mod tests {
                 .to_string()
                 .contains("require inline comments")
         );
+    }
+
+    #[test]
+    fn creation_accepts_formal_prerequisite_and_bounded_waits() {
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "op": "merge_proposal_create",
+            "repository": "~owner/project/+git/source",
+            "source_ref": "feature",
+            "target_ref": "main",
+            "commit_message": "Dependent feature",
+            "prerequisite_ref": "feature-base",
+            "prerequisite_repository": "~owner/project/+git/base",
+            "wait_for_index": true,
+            "index_timeout_seconds": 300,
+            "wait_for_preview": true,
+            "preview_timeout_seconds": 1
+        }))
+        .unwrap();
+        request.validate().unwrap();
+        assert_eq!(request.prerequisite_ref.as_deref(), Some("feature-base"));
+        assert_eq!(
+            request.prerequisite_repository.as_deref(),
+            Some("~owner/project/+git/base")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_creation_field_combinations() {
+        let cases = [
+            (
+                serde_json::json!({"merge_prerequisite": "base"}),
+                "use prerequisite_ref",
+            ),
+            (
+                serde_json::json!({"prerequisite_ref": " \t"}),
+                "prerequisite_ref cannot be empty",
+            ),
+            (
+                serde_json::json!({"prerequisite_repository": "other"}),
+                "requires prerequisite_ref",
+            ),
+            (
+                serde_json::json!({"prerequisite_ref": "base", "prerequisite_repository": "  "}),
+                "prerequisite_repository cannot be empty",
+            ),
+            (
+                serde_json::json!({"index_timeout_seconds": 10}),
+                "requires wait_for_index",
+            ),
+            (
+                serde_json::json!({"wait_for_index": false, "index_timeout_seconds": 10}),
+                "requires wait_for_index",
+            ),
+            (
+                serde_json::json!({"wait_for_index": true, "index_timeout_seconds": 0}),
+                "index_timeout_seconds must be between 1 and 300",
+            ),
+            (
+                serde_json::json!({"wait_for_index": true, "index_timeout_seconds": 301}),
+                "index_timeout_seconds must be between 1 and 300",
+            ),
+            (
+                serde_json::json!({"preview_timeout_seconds": 10}),
+                "requires wait_for_preview",
+            ),
+            (
+                serde_json::json!({"wait_for_preview": false, "preview_timeout_seconds": 10}),
+                "requires wait_for_preview",
+            ),
+            (
+                serde_json::json!({"wait_for_preview": true, "preview_timeout_seconds": 0}),
+                "preview_timeout_seconds must be between 1 and 300",
+            ),
+            (
+                serde_json::json!({"wait_for_preview": true, "preview_timeout_seconds": 301}),
+                "preview_timeout_seconds must be between 1 and 300",
+            ),
+        ];
+        for (fields, expected) in cases {
+            let mut input = serde_json::json!({
+                "op": "merge_proposal_create",
+                "repository": "~owner/project/+git/source",
+                "source_ref": "feature",
+                "target_ref": "main",
+                "commit_message": "Dependent feature"
+            });
+            for (key, value) in fields.as_object().unwrap() {
+                input[key.as_str()] = value.clone();
+            }
+            let request: Request = serde_json::from_value(input).unwrap();
+            assert!(
+                request
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected),
+                "{fields}"
+            );
+        }
+    }
+
+    #[test]
+    fn creation_fields_are_not_accepted_for_other_operations() {
+        let replacement: Request = serde_json::from_value(serde_json::json!({
+            "op": "replace_merge_proposal_prerequisite",
+            "target": "42",
+            "merge_prerequisite": "base"
+        }))
+        .unwrap();
+        replacement.validate().unwrap();
+
+        for (field, value) in [
+            ("prerequisite_ref", serde_json::json!("base")),
+            ("prerequisite_repository", serde_json::json!("other")),
+            ("wait_for_index", serde_json::json!(true)),
+            ("index_timeout_seconds", serde_json::json!(10)),
+            ("wait_for_preview", serde_json::json!(true)),
+            ("preview_timeout_seconds", serde_json::json!(10)),
+        ] {
+            let mut input = serde_json::json!({
+                "op": "replace_merge_proposal_prerequisite",
+                "target": "42",
+                "merge_prerequisite": "base"
+            });
+            input[field] = value;
+            let request: Request = serde_json::from_value(input).unwrap();
+            assert!(request.validate().is_err(), "{field}");
+        }
     }
 
     #[test]

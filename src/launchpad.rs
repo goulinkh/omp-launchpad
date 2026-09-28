@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, FixedOffset};
 use futures::{StreamExt, stream};
@@ -10,6 +11,8 @@ use lpcli::error::LpError;
 use lpcli::git::{GitRef, list_git_refs};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Value, json};
+use tokio::process::Command;
+use tokio::time::sleep;
 use url::Url;
 
 use crate::diff;
@@ -288,7 +291,16 @@ async fn view_preview_diffs(
     request: &Request,
 ) -> Result<OperationResult> {
     let (_, proposal) = request_merge_proposal(client, request).await?;
-    let mut preview_diffs = get_preview_diffs(client, &proposal).await?;
+    let mut preview_diffs =
+        if render::text_field(&proposal, "preview_diffs_collection_link").is_some() {
+            get_preview_diffs(client, &proposal).await?
+        } else if render::text_field(&proposal, "preview_diff_link").is_none() {
+            Vec::new()
+        } else {
+            return Err(Error::invalid(
+                "merge proposal has a current preview diff but no preview diff history",
+            ));
+        };
     let mut deleted_files = Vec::new();
     for preview_diff in &mut preview_diffs {
         let Some(diffstat) = preview_diff
@@ -324,30 +336,38 @@ async fn view_preview_diffs(
             ));
         }
     }
-    let current = get_preview_diff(client, &proposal, None).await?;
-    let current_id = preview_diff_id(&current)?;
+    let current = if let Some(link) = render::text_field(&proposal, "preview_diff_link") {
+        Some(client.get_url::<Value>(link).await?)
+    } else {
+        None
+    };
+    let current_id = current.as_ref().map(preview_diff_id).transpose()?;
     let source_url = render::text_field(&proposal, "web_link").map(str::to_owned);
     let proposal_id =
         render::resource_id(&proposal).ok_or_else(|| Error::invalid("merge proposal has no ID"))?;
     let mut text = render::render_preview_diffs(
         &preview_diffs,
-        current_id,
+        current_id.unwrap_or(0),
         &proposal_id,
         render::text_field(&proposal, "prerequisite_git_path"),
     );
     let mut revisions = String::new();
-    for (label, key) in [
-        ("Prerequisite revision", "prerequisite_revision_id"),
-        ("Source revision", "source_revision_id"),
-        ("Target revision", "target_revision_id"),
-    ] {
-        if let Some(revision) = render::text_field(&current, key) {
-            revisions.push_str(&format!("\n- **{label}:** `{revision}`"));
+    if let Some(current) = &current {
+        for (label, key) in [
+            ("Prerequisite revision", "prerequisite_revision_id"),
+            ("Source revision", "source_revision_id"),
+            ("Target revision", "target_revision_id"),
+        ] {
+            if let Some(revision) = render::text_field(current, key) {
+                revisions.push_str(&format!("\n- **{label}:** `{revision}`"));
+            }
         }
-    }
-    if !revisions.is_empty() {
-        text.push_str("\n\n## Current preview revisions");
-        text.push_str(&revisions);
+        if !revisions.is_empty() {
+            text.push_str("\n\n## Current preview revisions");
+            text.push_str(&revisions);
+        }
+    } else {
+        text.push_str("\n\nPreview generation is pending; retry this operation later.");
     }
     if !deleted_files.is_empty() {
         text.push_str("\n\n## Deleted files\n");
@@ -355,14 +375,18 @@ async fn view_preview_diffs(
     }
     let details = json!({
         "kind": "preview_diff_history",
-        "current_preview_diff_id": current_id,
-        "current_preview_diff": {
-            "id": current_id,
-            "prerequisite_revision_id": current.get("prerequisite_revision_id"),
-            "source_revision_id": current.get("source_revision_id"),
-            "target_revision_id": current.get("target_revision_id"),
-        },
+        "proposal_id": proposal_id,
+        "state": if current.is_some() { "ready" } else { "pending" },
+        "retryable": current.is_none(),
+        "diffs": preview_diffs,
         "preview_diffs": preview_diffs,
+        "current_preview_diff_id": current_id,
+        "current_preview_diff": current.as_ref().map(|preview| json!({
+            "id": current_id,
+            "prerequisite_revision_id": preview.get("prerequisite_revision_id"),
+            "source_revision_id": preview.get("source_revision_id"),
+            "target_revision_id": preview.get("target_revision_id"),
+        })),
         "prerequisite_ref": render::scalar_field(&proposal, "prerequisite_git_path"),
         "prerequisite_repository_link": render::scalar_field(&proposal, "prerequisite_git_repository_link"),
     });
@@ -1655,6 +1679,13 @@ struct PreparedMergeProposal {
     source_link: String,
     target_link: String,
     prerequisite_link: Option<String>,
+    source_repository_link: String,
+    target_repository_link: String,
+    prerequisite_repository_link: Option<String>,
+    source_ref: String,
+    target_ref: String,
+    prerequisite_ref: Option<String>,
+    source_commit_sha: Option<String>,
 }
 
 async fn prepare_merge_proposal(
@@ -1663,37 +1694,48 @@ async fn prepare_merge_proposal(
     source_ref: &str,
     target_repository: &str,
     target_ref: &str,
-    prerequisite_ref: Option<&str>,
+    prerequisite: Option<(&str, &str)>,
+    deadline: Option<Instant>,
 ) -> Result<PreparedMergeProposal> {
-    let source = find_git_ref(client, "source", source_repository, source_ref).await?;
-    let target = find_git_ref(client, "target", target_repository, target_ref).await?;
+    let (source, source_repository) =
+        find_git_ref(client, "source", source_repository, source_ref, deadline).await?;
+    let (target, target_repository) =
+        find_git_ref(client, "target", target_repository, target_ref, deadline).await?;
     let source_link = source.self_link.ok_or_else(|| {
         Error::invalid(format!(
-            "source ref {} in repository {source_repository} has no API link",
-            normalise_ref(source_ref)
+            "source ref {source_ref} in repository {source_repository} has no API link"
         ))
     })?;
     let target_link = target.self_link.ok_or_else(|| {
         Error::invalid(format!(
-            "target ref {} in repository {target_repository} has no API link",
-            normalise_ref(target_ref)
+            "target ref {target_ref} in repository {target_repository} has no API link"
         ))
     })?;
-    let prerequisite_link = if let Some(path) = prerequisite_ref {
-        let git_ref = find_git_ref(client, "prerequisite", source_repository, path).await?;
-        Some(git_ref.self_link.ok_or_else(|| {
+    let prerequisite = if let Some((repository, path)) = prerequisite {
+        let (git_ref, repository) =
+            find_git_ref(client, "prerequisite", repository, path, deadline).await?;
+        let link = git_ref.self_link.ok_or_else(|| {
             Error::invalid(format!(
-                "prerequisite ref {} in repository {source_repository} has no API link",
-                normalise_ref(path)
+                "prerequisite ref {path} in repository {repository} has no API link"
             ))
-        })?)
+        })?;
+        Some((link, repository, path.to_owned()))
     } else {
         None
     };
     Ok(PreparedMergeProposal {
         source_link,
         target_link,
-        prerequisite_link,
+        prerequisite_link: prerequisite.as_ref().map(|(link, _, _)| link.clone()),
+        source_repository_link: client.url(&format!("/{source_repository}")),
+        target_repository_link: client.url(&format!("/{target_repository}")),
+        prerequisite_repository_link: prerequisite
+            .as_ref()
+            .map(|(_, repository, _)| client.url(&format!("/{repository}"))),
+        source_ref: source_ref.to_owned(),
+        target_ref: target_ref.to_owned(),
+        prerequisite_ref: prerequisite.map(|(_, _, path)| path),
+        source_commit_sha: source.commit_sha1,
     })
 }
 
@@ -1742,41 +1784,222 @@ async fn create_merge_proposal(
         .map(normalise_repository)
         .transpose()?
         .unwrap_or_else(|| source_repository.clone());
-    let source_ref = request.string(&request.source_ref, "source_ref")?;
-    let target_ref = request.string(&request.target_ref, "target_ref")?;
+    let source_ref = normalise_ref(request.string(&request.source_ref, "source_ref")?);
+    let target_ref = normalise_ref(request.string(&request.target_ref, "target_ref")?);
+    let prerequisite_ref = request.prerequisite_ref.as_deref().map(normalise_ref);
+    let prerequisite_repository = request
+        .prerequisite_repository
+        .as_deref()
+        .map(normalise_repository)
+        .transpose()?;
     let commit_message = request.string(&request.commit_message, "commit_message")?;
+    let index_deadline = request.wait_for_index.unwrap_or(false).then(|| {
+        Instant::now() + Duration::from_secs(request.index_timeout_seconds.unwrap_or(180))
+    });
     let prepared = prepare_merge_proposal(
         client,
         &source_repository,
-        source_ref,
+        &source_ref,
         &target_repository,
-        target_ref,
-        request.merge_prerequisite.as_deref(),
+        &target_ref,
+        prerequisite_ref.as_deref().map(|path| {
+            (
+                prerequisite_repository
+                    .as_deref()
+                    .unwrap_or(&source_repository),
+                path,
+            )
+        }),
+        index_deadline,
     )
     .await?;
-    let location = submit_merge_proposal(
+    let existing = matching_proposals(client, &prepared, request, commit_message).await?;
+    let mut recent = existing.iter().filter(|proposal| {
+        render::text_field(proposal, "date_created")
+            .and_then(|date| DateTime::parse_from_rfc3339(date).ok())
+            .is_some_and(|date| {
+                let age = chrono::Utc::now().signed_duration_since(date).num_seconds();
+                (-60..600).contains(&age)
+            })
+    });
+    if let Some(proposal) = recent.next() {
+        if recent.next().is_some() {
+            return Err(Error::invalid(
+                "multiple recent proposals match this creation request; inspect their IDs before retrying",
+            ));
+        }
+        return creation_result(client, proposal.clone(), &prepared, request, "recovered").await;
+    }
+    let known_ids: HashSet<_> = existing.iter().filter_map(render::resource_id).collect();
+    let location = match submit_merge_proposal(
         client,
         &prepared,
         request.description.as_deref(),
         Some(commit_message),
         request.needs_review.unwrap_or(true),
     )
-    .await?;
+    .await
+    {
+        Ok(location) => location,
+        Err(error) if ambiguous_creation_error(&error) => {
+            let matches = matching_proposals(client, &prepared, request, commit_message).await
+                .map_err(|lookup| Error::invalid(format!(
+                    "creation outcome unknown ({error}); cannot inspect proposals to recover it: {lookup}; do not blindly retry"
+                )))?;
+            let mut created = matches.into_iter().filter(|proposal| {
+                render::resource_id(proposal).is_some_and(|id| !known_ids.contains(&id))
+            });
+            let proposal = created.next().ok_or_else(|| Error::invalid(format!(
+                "creation outcome unknown ({error}); no matching new proposal is visible yet; retry after Launchpad indexing, not by blindly submitting again"
+            )))?;
+            if created.next().is_some() {
+                return Err(Error::invalid(
+                    "creation outcome unknown; multiple matching new proposals found; inspect their IDs before retrying",
+                ));
+            }
+            return creation_result(client, proposal, &prepared, request, "recovered").await;
+        }
+        Err(error) => return Err(error),
+    };
     let proposal: Value = client.get_url(&location).await.map_err(|source| {
         Error::context(
-            format!("cannot load created merge proposal {location}"),
+            format!(
+                "proposal created at {location} but cannot load it; do not submit again blindly"
+            ),
             source.into(),
         )
     })?;
+    creation_result(client, proposal, &prepared, request, "new").await
+}
+
+async fn creation_result(
+    client: &LaunchpadClient,
+    mut proposal: Value,
+    prepared: &PreparedMergeProposal,
+    request: &Request,
+    creation_state: &str,
+) -> Result<OperationResult> {
+    let url = proposal_api_url(&proposal)?;
+    if request.wait_for_preview.unwrap_or(false) {
+        let deadline =
+            Instant::now() + Duration::from_secs(request.preview_timeout_seconds.unwrap_or(180));
+        let mut delay = Duration::from_secs(2);
+        while render::text_field(&proposal, "preview_diff_link").is_none()
+            && Instant::now() < deadline
+        {
+            sleep(delay.min(deadline.saturating_duration_since(Instant::now()))).await;
+            proposal = client.get_url(url.as_str()).await.map_err(|source| Error::context(
+                format!("proposal exists at {url}, but preview readiness could not be checked; do not create it again"),
+                source.into(),
+            ))?;
+            delay = (delay * 2).min(Duration::from_secs(16));
+        }
+    }
+    confirm_proposal(&proposal, prepared)?;
+    let preview_state = if render::text_field(&proposal, "preview_diff_link").is_some() {
+        "ready"
+    } else {
+        "pending"
+    };
+    let mut details = proposal_details(client, &proposal).await.map_err(|source| Error::context(
+        format!("proposal exists at {url}, but its repository metadata could not be loaded; do not create it again"),
+        source,
+    ))?;
+    details["source_commit_sha"] = json!(prepared.source_commit_sha);
+    details["preview_state"] = json!(preview_state);
+    details["creation_state"] = json!(creation_state);
     let text = format!(
-        "# Created Launchpad merge proposal\n\n{}",
-        render::render_proposal(&proposal, &[], &[], false, 1)
+        "# {} Launchpad merge proposal\n\n{}\n\n- **Source commit:** {}\n- **Prerequisite repository:** {}\n- **Preview:** {preview_state}",
+        if creation_state == "new" {
+            "Created"
+        } else {
+            "Recovered"
+        },
+        render::render_proposal(&proposal, &[], &[], false, 1),
+        prepared
+            .source_commit_sha
+            .as_deref()
+            .unwrap_or("unavailable"),
+        details["prerequisite_repository"]
+            .as_str()
+            .unwrap_or("none"),
     );
     let source_url = render::text_field(&proposal, "web_link").map(str::to_owned);
-    let details = proposal_details(client, &proposal).await?;
     Ok(OperationResult::new(text)
         .with_source_url(source_url)
         .with_details(details))
+}
+
+fn confirm_proposal(proposal: &Value, prepared: &PreparedMergeProposal) -> Result<()> {
+    for (field, expected) in [
+        ("source_git_path", Some(prepared.source_ref.as_str())),
+        ("target_git_path", Some(prepared.target_ref.as_str())),
+        (
+            "prerequisite_git_path",
+            prepared.prerequisite_ref.as_deref(),
+        ),
+        (
+            "source_git_repository_link",
+            Some(prepared.source_repository_link.as_str()),
+        ),
+        (
+            "target_git_repository_link",
+            Some(prepared.target_repository_link.as_str()),
+        ),
+        (
+            "prerequisite_git_repository_link",
+            prepared.prerequisite_repository_link.as_deref(),
+        ),
+    ] {
+        if render::text_field(proposal, field) != expected {
+            return Err(Error::invalid(format!(
+                "created proposal {} has {field} {:?}, expected {expected:?}; inspect the proposal before retrying",
+                render::resource_id(proposal).unwrap_or_else(|| "?".to_owned()),
+                render::text_field(proposal, field),
+            )));
+        }
+    }
+    if let (Some(actual), Some(expected)) = (
+        render::text_field(proposal, "source_git_commit_sha1"),
+        prepared.source_commit_sha.as_deref(),
+    ) && actual != expected
+    {
+        return Err(Error::invalid(format!(
+            "created proposal source commit {actual} differs from resolved source commit {expected}; inspect the proposal before retrying"
+        )));
+    }
+    Ok(())
+}
+
+async fn matching_proposals(
+    client: &LaunchpadClient,
+    prepared: &PreparedMergeProposal,
+    request: &Request,
+    commit_message: &str,
+) -> Result<Vec<Value>> {
+    let collection = format!(
+        "{}/landing_targets",
+        prepared.source_link.trim_end_matches('/')
+    );
+    Ok(fetch_all_entries(client, &collection)
+        .await?
+        .into_iter()
+        .filter(|proposal| {
+            confirm_proposal(proposal, prepared).is_ok()
+                && render::text_field(proposal, "commit_message") == Some(commit_message)
+                && render::text_field(proposal, "description").unwrap_or_default()
+                    == request.description.as_deref().unwrap_or_default()
+        })
+        .collect())
+}
+
+fn ambiguous_creation_error(error: &Error) -> bool {
+    matches!(error, Error::Context { source, .. } if matches!(
+        source.as_ref(),
+        Error::Launchpad { source: LpError::Timeout(_) | LpError::Connect(_) }
+    ) || matches!(source.as_ref(), Error::Launchpad {
+        source: LpError::Http(request)
+    } if request.is_timeout() || request.is_connect()))
 }
 
 async fn edit_merge_proposal(
@@ -1844,6 +2067,7 @@ async fn replace_merge_proposal_prerequisite(
         .ok_or_else(|| Error::invalid("merge proposal has no source ref"))?;
     let target_ref = render::text_field(&previous, "target_git_path")
         .ok_or_else(|| Error::invalid("merge proposal has no target ref"))?;
+    let prerequisite_ref = normalise_ref(prerequisite);
     let previous_url = proposal_api_url(&previous)?;
     let prepared = prepare_merge_proposal(
         client,
@@ -1851,7 +2075,8 @@ async fn replace_merge_proposal_prerequisite(
         source_ref,
         target_repository,
         target_ref,
-        Some(prerequisite),
+        Some((source_repository, &prerequisite_ref)),
+        None,
     )
     .await?;
     client
@@ -2613,8 +2838,8 @@ async fn find_git_ref(
     role: &str,
     repository: &str,
     requested_path: &str,
-) -> Result<GitRef> {
-    let requested_path = normalise_ref(requested_path);
+    deadline: Option<Instant>,
+) -> Result<(GitRef, String)> {
     let context = format!("cannot resolve {role} ref {requested_path} in repository {repository}");
     let resource = match get_repository(client, repository).await {
         Ok(resource) => resource,
@@ -2663,21 +2888,107 @@ async fn find_git_ref(
                 "{context}; Launchpad repository has no unique name"
             ))
         })?;
-    let git_refs = list_git_refs(client, canonical_repository)
-        .await
-        .map_err(|source| {
-            Error::context(
-                format!("{context} (canonical repository {canonical_repository})"),
-                source.into(),
-            )
-        })?;
-    git_refs
-        .into_iter()
-        .find(|git_ref| git_ref.path.as_deref() == Some(requested_path.as_str()))
-        .ok_or_else(|| {
-            Error::invalid(format!(
-                "{context} (canonical repository {canonical_repository}); ref was not found"
-            ))
+    let mut delay = Duration::from_secs(2);
+    loop {
+        let git_refs = list_git_refs(client, canonical_repository)
+            .await
+            .map_err(|source| {
+                Error::context(
+                    format!("{context} (canonical repository {canonical_repository})"),
+                    source.into(),
+                )
+            })?;
+        let git_ref = git_refs
+            .into_iter()
+            .find(|git_ref| git_ref.path.as_deref() == Some(requested_path));
+        let (commit, indexed_commit) = if let Some(git_ref) = git_ref {
+            if deadline.is_none() || git_ref.commit_sha1.is_none() {
+                return Ok((git_ref, canonical_repository.to_owned()));
+            }
+            match git_server_commit(&resource, requested_path).await {
+                GitVisibility::Present(commit)
+                    if git_ref.commit_sha1.as_deref() != Some(commit.as_str()) =>
+                {
+                    (commit, git_ref.commit_sha1)
+                }
+                _ => return Ok((git_ref, canonical_repository.to_owned())),
+            }
+        } else {
+            match git_server_commit(&resource, requested_path).await {
+                GitVisibility::Present(commit) => (commit, None),
+                GitVisibility::Absent => {
+                    return Err(Error::invalid(format!(
+                        "{context}; ref absent from both the canonical repository's Git server and Launchpad API"
+                    )));
+                }
+                GitVisibility::Unknown => {
+                    return Err(Error::RefVisibilityUnknown {
+                        reason: format!(
+                            "{context}; ref absent from Launchpad API but Git server visibility cannot be confirmed (transport, authentication, or permission error)"
+                        ),
+                    });
+                }
+            }
+        };
+        let last_scan = render::text_field(&resource, "date_last_scanned").unwrap_or("unavailable");
+        let pending = || Error::RefPendingIndex {
+            reason: format!(
+                "{role} ref {requested_path} in canonical repository {canonical_repository}; Git commit {commit}; Launchpad indexed commit {}; Launchpad last scan {last_scan}; Git publication succeeded, but Launchpad API indexing remains pending; retry later",
+                indexed_commit.as_deref().unwrap_or("unavailable")
+            ),
+        };
+        let Some(end) = deadline else {
+            return Err(pending());
+        };
+        let remaining = end.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(pending());
+        }
+        sleep(delay.min(remaining)).await;
+        delay = (delay * 2).min(Duration::from_secs(16));
+    }
+}
+
+enum GitVisibility {
+    Present(String),
+    Absent,
+    Unknown,
+}
+
+async fn git_server_commit(repository: &Value, path: &str) -> GitVisibility {
+    let Some(url) = render::text_field(repository, "git_https_url") else {
+        return GitVisibility::Unknown;
+    };
+    let Ok(parsed) = Url::parse(url) else {
+        return GitVisibility::Unknown;
+    };
+    if parsed.scheme() != "https" && !(cfg!(test) && parsed.scheme() == "file") {
+        return GitVisibility::Unknown;
+    }
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        Command::new("git")
+            .args(["ls-remote", "--refs", url, path])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    let Ok(Ok(result)) = result else {
+        return GitVisibility::Unknown;
+    };
+    if !result.status.success() {
+        return GitVisibility::Unknown;
+    }
+    let Ok(output) = std::str::from_utf8(&result.stdout) else {
+        return GitVisibility::Unknown;
+    };
+    output
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .find(|(_, git_path)| *git_path == path)
+        .map_or(GitVisibility::Absent, |(sha, _)| {
+            GitVisibility::Present(sha.to_owned())
         })
 }
 
@@ -3145,11 +3456,13 @@ mod tests {
             &client,
             "source",
             "git+ssh://goulinkh@git.launchpad.net/mobot",
-            "feature",
+            "refs/heads/feature",
+            None,
         )
         .await;
         server.abort();
-        let git_ref = result.unwrap();
+        let (git_ref, repository) = result.unwrap();
+        assert_eq!(repository, canonical);
         assert_eq!(git_ref.path.as_deref(), Some("refs/heads/feature"));
         assert_eq!(
             git_ref.self_link.as_deref(),
@@ -3200,20 +3513,143 @@ mod tests {
             }
         });
         let client = LaunchpadClient::new(None).with_base_url(format!("http://{address}/devel"));
-        let git_ref = find_git_ref(
+        let (git_ref, repository) = find_git_ref(
             &client,
             "source",
             "git+ssh://git@git.launchpad.net/~owner/project",
-            "feature",
+            "refs/heads/feature",
+            None,
         )
         .await
         .unwrap();
         server.await.unwrap();
+        assert_eq!(repository, canonical);
         assert_eq!(git_ref.path.as_deref(), Some("refs/heads/feature"));
         assert_eq!(
             git_ref.self_link.as_deref(),
             Some(format!("http://{address}/devel/{canonical}/+ref/feature").as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn git_visible_ref_waits_for_launchpad_index() {
+        let directory = std::env::temp_dir().join(format!(
+            "omp-launchpad-ref-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q", "-b", "feature"])
+                .arg(&directory)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&directory)
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "--allow-empty",
+                    "-q",
+                    "-m",
+                    "initial"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let sha = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&directory)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let git_url = Url::from_directory_path(&directory).unwrap().to_string();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_sha = sha.clone();
+        let server = tokio::spawn(async move {
+            let mut scans = 0;
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let headers = read_request_headers(&mut stream).await;
+                let path = headers.split_ascii_whitespace().nth(1).unwrap();
+                let body = if path.starts_with("/devel/+git?") {
+                    json!({
+                        "unique_name": "~owner/project/+git/repo",
+                        "git_https_url": git_url,
+                        "date_last_scanned": "2026-09-28T00:00:00Z"
+                    })
+                } else if path == "/devel/~owner/project/+git/repo/refs" {
+                    scans += 1;
+                    json!({
+                        "entries": if scans >= 2 { vec![json!({
+                            "path": "refs/heads/feature",
+                            "commit_sha1": if scans == 2 { "stale-sha" } else { &server_sha },
+                            "self_link": format!("http://{address}/devel/~owner/project/+git/repo/+ref/feature")
+                        })] } else { vec![] },
+                        "next_collection_link": null
+                    })
+                } else {
+                    panic!("unexpected request: {path}");
+                }.to_string();
+                stream.write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ).as_bytes()).await.unwrap();
+            }
+        });
+        let client = LaunchpadClient::new(None).with_base_url(format!("http://{address}/devel"));
+        let pending = find_git_ref(
+            &client,
+            "source",
+            "~owner/project/+git/repo",
+            "refs/heads/feature",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(pending.code(), Some("ref_pending_index"));
+        assert!(pending.to_string().contains(&sha));
+        let (indexed, _) = find_git_ref(
+            &client,
+            "source",
+            "~owner/project/+git/repo",
+            "refs/heads/feature",
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(indexed.commit_sha1.as_deref(), Some(sha.as_str()));
+        let missing = find_git_ref(
+            &client,
+            "source",
+            "~owner/project/+git/repo",
+            "refs/heads/never-created",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_ne!(missing.code(), Some("ref_pending_index"));
+        assert!(missing.to_string().contains("absent from both"));
+        server.abort();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
@@ -3408,12 +3844,19 @@ mod tests {
     async fn proposal_scenario(
         reject_creation: bool,
         create_only: bool,
+        cross_repository: bool,
+        recover_existing: bool,
     ) -> (
         crate::result::Result<crate::response::OperationResult>,
         Vec<String>,
         Vec<(String, String)>,
     ) {
         let repository = "~owner/project/+git/repo";
+        let prerequisite_repository = if cross_repository {
+            "~owner/project/+git/base-repo"
+        } else {
+            repository
+        };
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let base = format!("http://{address}/devel");
@@ -3454,18 +3897,20 @@ mod tests {
                         None,
                     )
                 } else if method == "GET" && path.starts_with("/devel/+git?") {
-                    assert_eq!(
-                        Url::parse(&format!("http://localhost{path}"))
-                            .unwrap()
-                            .query_pairs()
-                            .find(|(key, _)| key == "path")
-                            .unwrap()
-                            .1,
-                        repository
+                    let requested = Url::parse(&format!("http://localhost{path}"))
+                        .unwrap()
+                        .query_pairs()
+                        .find(|(key, _)| key == "path")
+                        .unwrap()
+                        .1
+                        .into_owned();
+                    assert!(
+                        requested == repository
+                            || (cross_repository && requested == prerequisite_repository)
                     );
                     (
                         "200 OK",
-                        json!({ "unique_name": repository }).to_string(),
+                        json!({ "unique_name": requested }).to_string(),
                         None,
                     )
                 } else if method == "GET" && path == refs_path {
@@ -3474,10 +3919,46 @@ mod tests {
                         .map(|name| {
                             json!({
                                 "path": format!("refs/heads/{name}"),
+                                "commit_sha1": format!("sha-{name}"),
                                 "self_link": format!("{server_base}/{repository}/+ref/{name}")
                             })
                         })
                         .collect();
+                    (
+                        "200 OK",
+                        json!({ "entries": entries, "next_collection_link": null }).to_string(),
+                        None,
+                    )
+                } else if cross_repository
+                    && method == "GET"
+                    && path == format!("/devel/{prerequisite_repository}/refs")
+                {
+                    ("200 OK", json!({
+                        "entries": [{
+                            "path": "refs/heads/base",
+                            "self_link": format!("{server_base}/{prerequisite_repository}/+ref/base")
+                        }], "next_collection_link": null
+                    }).to_string(), None)
+                } else if method == "GET" && path == format!("{source_path}/landing_targets") {
+                    let entries = if recover_existing {
+                        vec![json!({
+                            "id": 43,
+                            "self_link": format!("{server_base}/{repository}/+merge/43"),
+                            "web_link": "https://code.launchpad.net/new/+merge/43",
+                            "date_created": chrono::Utc::now().to_rfc3339(),
+                            "commit_message": "Add dependent feature",
+                            "description": "Stacked change",
+                            "source_git_repository_link": format!("{server_base}/{repository}"),
+                            "target_git_repository_link": format!("{server_base}/{repository}"),
+                            "source_git_path": "refs/heads/feature",
+                            "target_git_path": "refs/heads/main",
+                            "prerequisite_git_repository_link": format!("{server_base}/{prerequisite_repository}"),
+                            "prerequisite_git_path": "refs/heads/base",
+                            "source_git_commit_sha1": "sha-feature"
+                        })]
+                    } else {
+                        Vec::new()
+                    };
                     (
                         "200 OK",
                         json!({ "entries": entries, "next_collection_link": null }).to_string(),
@@ -3525,20 +4006,24 @@ mod tests {
                             "web_link": "https://code.launchpad.net/new/+merge/43",
                             "queue_status": "Needs review",
                             "commit_message": "Add dependent feature",
+                            "description": "Stacked change",
                             "source_git_repository_link": format!("{server_base}/{repository}"),
                             "target_git_repository_link": format!("{server_base}/{repository}"),
                             "source_git_path": "refs/heads/feature",
                             "target_git_path": "refs/heads/main",
-                            "prerequisite_git_repository_link": format!("{server_base}/{repository}"),
+                            "prerequisite_git_repository_link": format!("{server_base}/{prerequisite_repository}"),
                             "prerequisite_git_path": "refs/heads/base"
                         })
                         .to_string(),
                         None,
                     )
-                } else if method == "GET" && path == format!("/devel/{repository}") {
+                } else if method == "GET"
+                    && (path == format!("/devel/{repository}")
+                        || path == format!("/devel/{prerequisite_repository}"))
+                {
                     (
                         "200 OK",
-                        json!({ "unique_name": repository }).to_string(),
+                        json!({ "unique_name": if path == format!("/devel/{repository}") { repository } else { prerequisite_repository } }).to_string(),
                         None,
                     )
                 } else {
@@ -3560,7 +4045,8 @@ mod tests {
                 "repository": repository,
                 "source_ref": "feature",
                 "target_ref": "main",
-                "merge_prerequisite": "base",
+                "prerequisite_ref": "base",
+                "prerequisite_repository": cross_repository.then_some(prerequisite_repository),
                 "description": "Stacked change",
                 "commit_message": "Add dependent feature"
             })
@@ -3583,13 +4069,13 @@ mod tests {
         while let Ok(status) = statuses_rx.try_recv() {
             statuses.push(status);
         }
-        let parameters = creation_rx.try_recv().unwrap();
+        let parameters = creation_rx.try_recv().unwrap_or_default();
         (result, statuses, parameters)
     }
 
     #[tokio::test]
     async fn replacement_preserves_main_target_and_sets_prerequisite() {
-        let (result, statuses, parameters) = proposal_scenario(false, false).await;
+        let (result, statuses, parameters) = proposal_scenario(false, false, false, false).await;
         assert_eq!(statuses, ["Superseded"]);
         let fields: HashMap<_, _> = parameters.into_iter().collect();
         assert!(fields["merge_target"].ends_with("/+ref/main"));
@@ -3608,7 +4094,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_replacement_restores_old_status() {
-        let (result, statuses, _) = proposal_scenario(true, false).await;
+        let (result, statuses, _) = proposal_scenario(true, false, false, false).await;
         assert_eq!(statuses, ["Superseded", "Needs review"]);
         assert!(
             result
@@ -3620,7 +4106,7 @@ mod tests {
 
     #[tokio::test]
     async fn creation_keeps_main_target_separate_from_prerequisite() {
-        let (result, statuses, parameters) = proposal_scenario(false, true).await;
+        let (result, statuses, parameters) = proposal_scenario(false, true, false, false).await;
         assert!(statuses.is_empty());
         let fields: HashMap<_, _> = parameters.into_iter().collect();
         assert!(fields["merge_target"].ends_with("/+ref/main"));
@@ -3634,6 +4120,160 @@ mod tests {
                 .text
                 .contains("Merge proposal 43: Add dependent feature")
         );
+        assert_eq!(result.details["source_commit_sha"], "sha-feature");
+        assert_eq!(result.details["preview_state"], "pending");
+        assert_eq!(result.details["creation_state"], "new");
+        assert_eq!(
+            result.details["prerequisite_repository"],
+            "~owner/project/+git/repo"
+        );
+    }
+
+    #[tokio::test]
+    async fn creation_confirms_cross_repository_prerequisite() {
+        let (result, _, parameters) = proposal_scenario(false, true, true, false).await;
+        let fields: HashMap<_, _> = parameters.into_iter().collect();
+        assert!(fields["merge_target"].ends_with("/repo/+ref/main"));
+        assert!(fields["merge_prerequisite"].ends_with("/base-repo/+ref/base"));
+        let result = result.unwrap();
+        assert_eq!(result.details["prerequisite_ref"], "refs/heads/base");
+        assert_eq!(
+            result.details["prerequisite_repository"],
+            "~owner/project/+git/base-repo"
+        );
+    }
+
+    #[tokio::test]
+    async fn creation_retry_recovers_recent_matching_proposal_without_posting() {
+        let (result, statuses, parameters) = proposal_scenario(false, true, false, true).await;
+        assert!(statuses.is_empty());
+        assert!(parameters.is_empty());
+        let result = result.unwrap();
+        assert_eq!(result.details["id"], "43");
+        assert_eq!(result.details["creation_state"], "recovered");
+        assert_eq!(result.details["source_commit_sha"], "sha-feature");
+        assert!(
+            result
+                .text
+                .starts_with("# Recovered Launchpad merge proposal")
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_history_reports_pending_before_first_diff() {
+        let repository = "~owner/project/+git/repo";
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for expected in [
+                format!("/devel/{repository}/+merge/42"),
+                format!("/devel/{repository}/+merge/42/preview_diffs"),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let headers = read_request_headers(&mut stream).await;
+                assert!(headers.contains(&format!("GET {expected} ")));
+                let body = if expected.ends_with("/preview_diffs") {
+                    json!({ "entries": [], "next_collection_link": null })
+                } else {
+                    json!({
+                        "id": 42,
+                        "self_link": format!("http://{address}/devel/{repository}/+merge/42"),
+                        "preview_diffs_collection_link": format!("http://{address}/devel/{repository}/+merge/42/preview_diffs"),
+                        "web_link": "https://code.launchpad.net/old/+merge/42"
+                    })
+                }.to_string();
+                stream.write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ).as_bytes()).await.unwrap();
+            }
+        });
+        let client = LaunchpadClient::new(None).with_base_url(format!("http://{address}/devel"));
+        let request: Request = serde_json::from_value(json!({
+            "op": "preview_diffs",
+            "target": format!("lp://{repository}/+merge/42")
+        }))
+        .unwrap();
+        let result = super::view_preview_diffs(&client, &request).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(result.details["state"], "pending");
+        assert_eq!(result.details["retryable"], true);
+        assert_eq!(result.details["diffs"], json!([]));
+        assert!(result.text.contains("Preview generation is pending"));
+    }
+
+    #[tokio::test]
+    async fn creation_wait_reports_preview_when_it_becomes_ready() {
+        let repository = "~owner/project/+git/repo";
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let base = format!("http://{address}/devel");
+        let repository_link = format!("{base}/{repository}");
+        let proposal_link = format!("{repository_link}/+merge/42");
+        let server_repository = repository_link.clone();
+        let server_proposal = proposal_link.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let headers = read_request_headers(&mut stream).await;
+                let path = headers.split_ascii_whitespace().nth(1).unwrap();
+                let body = if path == format!("/devel/{repository}/+merge/42") {
+                    json!({
+                        "self_link": server_proposal,
+                        "web_link": "https://code.launchpad.net/new/+merge/42",
+                        "source_git_repository_link": server_repository,
+                        "target_git_repository_link": server_repository,
+                        "source_git_path": "refs/heads/feature",
+                        "target_git_path": "refs/heads/main",
+                        "preview_diff_link": format!("{server_proposal}/+preview-diff/7")
+                    })
+                } else {
+                    assert_eq!(path, format!("/devel/{repository}"));
+                    json!({ "unique_name": repository })
+                }
+                .to_string();
+                stream.write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ).as_bytes()).await.unwrap();
+            }
+        });
+        let client = LaunchpadClient::new(None).with_base_url(base);
+        let request: Request = serde_json::from_value(json!({
+            "op": "merge_proposal_create",
+            "repository": repository,
+            "source_ref": "feature",
+            "target_ref": "main",
+            "commit_message": "Feature",
+            "wait_for_preview": true,
+            "preview_timeout_seconds": 3
+        }))
+        .unwrap();
+        let prepared = super::PreparedMergeProposal {
+            source_link: format!("{repository_link}/+ref/feature"),
+            target_link: format!("{repository_link}/+ref/main"),
+            prerequisite_link: None,
+            source_repository_link: repository_link.clone(),
+            target_repository_link: repository_link.clone(),
+            prerequisite_repository_link: None,
+            source_ref: "refs/heads/feature".to_owned(),
+            target_ref: "refs/heads/main".to_owned(),
+            prerequisite_ref: None,
+            source_commit_sha: Some("abc123".to_owned()),
+        };
+        let proposal = json!({
+            "self_link": proposal_link,
+            "source_git_repository_link": repository_link,
+            "target_git_repository_link": repository_link,
+            "source_git_path": "refs/heads/feature",
+            "target_git_path": "refs/heads/main"
+        });
+        let result = super::creation_result(&client, proposal, &prepared, &request, "new")
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(result.details["preview_state"], "ready");
+        assert_eq!(result.details["source_commit_sha"], "abc123");
     }
 
     #[tokio::test]

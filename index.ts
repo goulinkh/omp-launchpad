@@ -28,7 +28,7 @@ interface BridgeSuccess {
 interface BridgeFailure {
   ok: false
   error: string
-  code?: "not_authenticated"
+  code?: "not_authenticated" | "ref_pending_index" | "ref_visibility_unknown"
 }
 
 type BridgePayload = BridgeSuccess | BridgeFailure
@@ -164,7 +164,8 @@ export default function launchpadExtension(pi: ExtensionAPI) {
     name: "launchpad",
     label: "Launchpad",
     description:
-      "Read Launchpad through lpcli. Repository inputs accept Launchpad paths and Git remote URLs. Branch and current " +
+      "Read Launchpad through the bundled lpcli library; no standalone lpcli command is required. Authenticate with " +
+      "/launchpad login in OMP. Repository inputs accept Launchpad paths and Git remote URLs. Branch and current " +
       "checkout lookup use explicit proposal selection rules and report the selected proposal and reason. Discussion " +
       "defaults to a compact review summary; format can request structured data or both. Merge proposal targets accept " +
       "a full Launchpad URL/path or a numeric ID when the working checkout has a related Launchpad remote. Prefer read " +
@@ -263,7 +264,8 @@ export default function launchpadExtension(pi: ExtensionAPI) {
     name: "launchpad_write",
     label: "Launchpad Write",
     description:
-      "Mutate Launchpad or local Git state: create or replace merge proposals, edit proposal metadata, create bugs, " +
+      "Mutate Launchpad or local Git state through the bundled lpcli library; no standalone lpcli command is required. " +
+      "Authenticate with /launchpad login in OMP. Create or replace merge proposals, edit proposal metadata, create bugs, " +
       "add comments, update inline review drafts, submit reviews, change proposal status, check out or push branches.",
     parameters: z.union([
       z.object({
@@ -281,12 +283,17 @@ export default function launchpadExtension(pi: ExtensionAPI) {
         target_repository: z.string().optional(),
         source_ref: z.string(),
         target_ref: z.string().describe("Merge destination Git ref, such as main; do not use the prerequisite branch here."),
-        merge_prerequisite: z.string().optional().describe("Optional prerequisite Git ref in the source repository; Launchpad exposes it as prerequisite_git_path on proposal reads."),
+        prerequisite_ref: z.string().min(1).optional().describe("Formal prerequisite Git ref; unlike target_ref, this is the branch the source builds on."),
+        prerequisite_repository: z.string().min(1).optional().describe("Repository containing prerequisite_ref; requires prerequisite_ref and defaults to the source repository."),
         description: z.string().optional(),
         commit_message: z.string().min(1).describe("Required merge commit message; used as the proposal title."),
         needs_review: z.boolean().optional(),
+        wait_for_index: z.boolean().optional().describe("Wait before submission for a Git-visible ref to appear in Launchpad's API ref collection."),
+        index_timeout_seconds: positiveInteger.max(300).optional().describe("Index wait deadline in seconds (1–300); requires wait_for_index: true."),
+        wait_for_preview: z.boolean().optional().describe("Wait for Launchpad to generate the proposal preview diff after creation."),
+        preview_timeout_seconds: positiveInteger.max(300).optional().describe("Preview wait deadline in seconds (1–300); requires wait_for_preview: true."),
         ...withIntent,
-      }),
+      }).strict(),
       z.object({
         op: z.literal("merge_proposal_edit"),
         target: mergeProposalTarget,

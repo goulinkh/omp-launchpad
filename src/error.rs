@@ -36,6 +36,10 @@ pub enum Error {
     #[error("invalid request: {reason}")]
     InvalidRequest { reason: String },
 
+    #[error("ref_pending_index: {reason}")]
+    RefPendingIndex { reason: String },
+    #[error("ref_visibility_unknown: {reason}")]
+    RefVisibilityUnknown { reason: String },
     #[error("cannot decode command output: {source}")]
     OutputEncoding { source: FromUtf8Error },
 
@@ -68,6 +72,8 @@ impl Error {
             Self::Launchpad {
                 source: LpError::NotAuthenticated | LpError::Api { status: 401, .. },
             } => Some("not_authenticated"),
+            Self::RefPendingIndex { .. } => Some("ref_pending_index"),
+            Self::RefVisibilityUnknown { .. } => Some("ref_visibility_unknown"),
             Self::Context { source, .. } => source.code(),
             _ => None,
         }

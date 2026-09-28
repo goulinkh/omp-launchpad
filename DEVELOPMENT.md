@@ -18,12 +18,14 @@ from an OMP session when write access is required:
 /launchpad status
 ```
 
-The extension uses the bundled `lpcli` library. A separately installed `lpcli` command can also manage the same credentials.
-
-If `lpcli` is not installed, use `/launchpad login` in OMP or
-`cargo run --release -- login` from this checkout. `file_read` uses anonymous
-Git HTTP, not the API login. A redirect may mean a missing or inaccessible
-repository, file, or branch; private files need an authenticated Git checkout.
+The extension uses its bundled `lpcli` library; a separately installed
+`lpcli` command is not required. An installed standalone command can also
+manage the same credentials. To authenticate, use `/launchpad login` in OMP
+or `cargo run --release -- login` from this checkout. Agents should use the
+Launchpad tools or `/launchpad login` instead of probing `lpcli --help`.
+`file_read` uses anonymous Git HTTP, not the API login. A redirect may mean
+a missing or inaccessible repository, file, or branch; private files need an
+authenticated Git checkout.
 
 Public resources can be tested without credentials by setting:
 

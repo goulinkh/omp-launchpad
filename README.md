@@ -56,6 +56,10 @@ If `lpcli` is not installed in your shell, use `/launchpad login` in OMP or
 credentials print a login hint with an exact terminal command that first selects
 the bridge's working directory. Login requires an interactive terminal and browser.
 
+Agents should use the `launchpad` and `launchpad_write` tools or the
+`/launchpad login` command; probing `lpcli --help` is not a prerequisite and
+may fail simply because no standalone executable is installed.
+
 ## Quick start
 
 Start OMP and refer to a Launchpad resource in your prompt:
@@ -122,7 +126,7 @@ Use launchpad with op merge_proposal_discussion, comments inline, current_diff_o
 
 Use launchpad with op preview_diffs for lp://~owner/project/+git/repository/+merge/123.
 
-Create a merge proposal from feature-2 into main with feature-1 as merge_prerequisite and commit_message "Add the dependent feature".
+Create a merge proposal from feature-2 into main with prerequisite_ref feature-1, prerequisite_repository ~owner/project/+git/base, commit_message "Add the dependent feature", wait_for_index true, and wait_for_preview true.
 
 Replace the prerequisite on lp://~owner/project/+git/repository/+merge/123 with feature-1.
 
@@ -142,19 +146,46 @@ checkout has a related Launchpad remote; use the full Launchpad URL or path
 when no repository context is available.
 
 Merge-proposal creation resolves `source_ref`, `target_ref`, and optional
-`merge_prerequisite` Git refs. Set `target_ref` to the merge destination (for
-example, `main`) and `merge_prerequisite` to the branch the source builds on.
-Launchpad calls the resulting read-only proposal field `prerequisite_git_path`;
-it is not a creation parameter. The prerequisite is looked up in the source
-repository. Git SSH aliases such as `~owner/project` fall back to
+`prerequisite_ref` Git refs. Set `target_ref` to the merge destination (for
+example, `main`), and `prerequisite_ref` to the formal prerequisite branch the
+source builds on. `prerequisite_repository` selects its repository and requires
+`prerequisite_ref`; when omitted, the prerequisite is looked up in the source
+repository. Launchpad exposes the resulting read-only proposal field as
+`prerequisite_git_path`; that field is not a creation parameter. Replacement
+continues to use `merge_prerequisite` instead of the creation fields.
+
+Git SSH aliases such as `~owner/project` fall back to
 `~owner/project/+git/project` when Launchpad cannot resolve the short path;
 other unresolved aliases report the canonical `lp://` path to supply.
 Creation requires a nonblank `commit_message`; Launchpad uses it as the
 proposal title. `description` remains optional and does not supply a title.
-Proposal reads and `preview_diffs` show the prerequisite; preview history
-includes the prerequisite revision used by Launchpad to generate the diff.
-Deleted files in preview diffstat are reported by their source paths rather
-than Launchpad's `dev/null` placeholder.
+The creation result includes the canonical refs, prerequisite metadata, and
+the source commit when Launchpad exposes it. Proposal reads and `preview_diffs`
+show the prerequisite; preview history includes the prerequisite revision used
+by Launchpad to generate the diff. Deleted files in preview diffstat are
+reported by their source paths rather than Launchpad's `dev/null` placeholder.
+
+Launchpad's Git server may expose a newly pushed ref before its API ref collection
+does. A Git-visible but API-missing ref reports `ref_pending_index`;
+`wait_for_index: true` waits before proposal submission for API visibility.
+It cannot fix a wrong repository, inaccessible Git server, or missing ref.
+`wait_for_preview: true` separately waits for Launchpad to generate
+the preview diff. Optional `index_timeout_seconds` and
+`preview_timeout_seconds` require their corresponding wait flag to be true and
+each must be between 1 and 300 seconds. Waiting is bounded; it does not make
+asynchronous Launchpad work instantaneous. Creation reports `creation_state`
+and `preview_state`; a pending preview is not a failed creation.
+`preview_diffs` can return `state: pending`, `diffs: []`, and `retryable: true`
+until Launchpad finishes generating the diff. Retry that read rather than
+creating a second proposal.
+
+Creation checks for a recent proposal with matching source, target, prerequisite,
+commit message, description, and source commit (when available) before posting.
+After an ambiguous submission timeout it checks for a newly indexed match
+instead of posting again; `creation_state: recovered` distinguishes recovery
+from a new submission. If the outcome remains unknown, inspect the source
+branch's proposals before retrying. This is not an idempotency guarantee for
+older proposals or concurrently identical requests.
 
 `merge_proposal_edit` changes `commit_message` and/or `description` on the
 same proposal via Launchpad's writable fields. It cannot change the source,
