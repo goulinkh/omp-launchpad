@@ -1,5 +1,7 @@
+import { fileURLToPath } from "node:url"
+
 import { describe, expect, test } from "bun:test"
-import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions"
+import { loadExtensions, type ExtensionContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions"
 import { LaunchpadStatusController } from "../src/status"
 
 type StatusContext = Pick<ExtensionContext, "clearTimer" | "cwd" | "hasUI" | "setTimeout" | "ui">
@@ -134,4 +136,11 @@ describe("LaunchpadStatusController", () => {
     controller.dispose()
     expect(lookupSignal?.aborted).toBe(true)
   })
+})
+
+test("extension validates before settings initialization", async () => {
+  const extension = fileURLToPath(new URL("../index.ts", import.meta.url))
+  const { errors } = await loadExtensions([extension], process.cwd())
+
+  expect(errors).toEqual([])
 })

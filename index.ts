@@ -48,7 +48,6 @@ export default function launchpadExtension(pi: ExtensionAPI) {
   const status = new LaunchpadStatusController((signal, cwd) =>
     runBridge({ op: "current_merge_proposal" }, signal, cwd)
   )
-  configureInlineStatus(pi)
 
   pi.setLabel("Launchpad")
   pi.registerCommand("launchpad", {
@@ -92,6 +91,7 @@ export default function launchpadExtension(pi: ExtensionAPI) {
   })
 
   pi.on("session_start", (_event, ctx) => {
+    if (ctx.hasUI) configureInlineStatus(pi)
     status.refresh(ctx)
   })
   pi.on("session_switch", (_event, ctx) => {
