@@ -33,6 +33,8 @@ Search project bugs and repository merge proposals. Authenticated operations can
 
 ## Install
 
+Requires OMP 18.4.10 or newer, with the registered setting-handle API.
+
 Install the npm package. It contains the published Rust binaries for every
 supported platform, so installation does not build repository source:
 

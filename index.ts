@@ -2,6 +2,13 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions"
+import {
+  cfgStatusLineLeftSegments,
+  cfgStatusLinePreset,
+  cfgStatusLineRightSegments,
+  cfgStatusLineSegmentOptions,
+  cfgStatusLineShowHookStatus,
+} from "@oh-my-pi/pi-coding-agent/modes/settings"
 import { existsSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -508,17 +515,17 @@ async function runCommand(command: "logout" | "status", cwd: string): Promise<st
 /** Keep the active layout while moving all extension statuses from an extra row into the status bar. */
 function configureInlineStatus(pi: ExtensionAPI): void {
   const { settings, getPreset } = pi.pi
-  if (!settings.get("statusLine.showHookStatus")) return
+  if (!cfgStatusLineShowHookStatus.get(settings)) return
 
-  const preset = settings.get("statusLine.preset")
+  const preset = cfgStatusLinePreset.get(settings)
   const definition = getPreset(preset)
-  const left = preset === "custom" ? settings.get("statusLine.leftSegments") : definition.leftSegments
-  const right = preset === "custom" ? settings.get("statusLine.rightSegments") : definition.rightSegments
+  const left = preset === "custom" ? cfgStatusLineLeftSegments.get(settings) : definition.leftSegments
+  const right = preset === "custom" ? cfgStatusLineRightSegments.get(settings) : definition.rightSegments
   if (!left.includes("status") && !right.includes("status")) {
     const gitIndex = left.indexOf("git")
     const presetOptions: Record<string, unknown> = { ...definition.segmentOptions }
     const configuredOptions = Object.fromEntries(
-      Object.entries(settings.get("statusLine.segmentOptions")).map(([name, value]) => {
+      Object.entries(cfgStatusLineSegmentOptions.get(settings)).map(([name, value]) => {
         const defaults = presetOptions[name]
         return [
           name,
@@ -529,14 +536,14 @@ function configureInlineStatus(pi: ExtensionAPI): void {
         ]
       })
     )
-    settings.override("statusLine.preset", "custom")
+    cfgStatusLinePreset.override(settings, "custom")
     const inlineLeft = [...left]
     inlineLeft.splice(gitIndex < 0 ? inlineLeft.length : gitIndex + 1, 0, "status")
-    settings.override("statusLine.leftSegments", inlineLeft)
-    settings.override("statusLine.rightSegments", [...right])
-    settings.override("statusLine.segmentOptions", { ...presetOptions, ...configuredOptions })
+    cfgStatusLineLeftSegments.override(settings, inlineLeft)
+    cfgStatusLineRightSegments.override(settings, [...right])
+    cfgStatusLineSegmentOptions.override(settings, { ...presetOptions, ...configuredOptions })
   }
-  settings.override("statusLine.showHookStatus", false)
+  cfgStatusLineShowHookStatus.override(settings, false)
 }
 
 function isLaunchpadUrl(path: unknown): path is string {

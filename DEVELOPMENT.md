@@ -4,7 +4,7 @@
 
 - Bun
 - Rust 1.88 or newer
-- OMP 18.1.19 or newer
+- OMP 18.4.10 or newer
 - Launchpad API credentials for authenticated and write operations; authenticated Git access for private repository files
 
 The pinned toolchain in `rust-toolchain.toml` applies when running from this
@@ -265,7 +265,7 @@ omp plugin link "$PWD"
 omp plugin list --json
 ```
 
-The list must show `omp-launchpad`, version `0.8.0`, with its path resolving to
+The list must show `omp-launchpad`, version `0.8.2`, with its path resolving to
 this checkout. Start a fresh OMP process and repeat the read-path smoke tests
 without `--no-extensions -e ./index.ts`:
 
@@ -287,7 +287,7 @@ To return to the published plugin after local testing, install the pinned npm
 package:
 
 ```sh
-omp plugin install omp-launchpad@0.8.0
+omp plugin install omp-launchpad@0.8.2
 ```
 
 ## Bridge-only diagnosis
